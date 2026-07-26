@@ -39,6 +39,8 @@ const AppKitEventKind = enum(c_int) {
     gpu_surface_scroll_driver = 18,
     context_menu_action = 19,
     audio = 20,
+    video = 21,
+    view_focused = 22,
 };
 
 const AppKitEvent = extern struct {
@@ -51,6 +53,9 @@ const AppKitEvent = extern struct {
     y: f64,
     open: c_int,
     focused: c_int,
+    /// WINDOW_FRAME: nonzero while the window is alive but hidden by
+    /// its close_policy (`open` stays 1 for the whole hidden stretch).
+    hidden: c_int,
     label: [*]const u8,
     label_len: usize,
     shortcut_id: [*]const u8,
@@ -90,6 +95,7 @@ const AppKitEvent = extern struct {
     reduce_motion: c_int,
     high_contrast: c_int,
     timer_id: u64,
+    scroll_driver_offset_x: f64,
     scroll_driver_offset_y: f64,
     menu_item_id: u32,
     /// Host-stamped packet decode/draw durations riding the frame
@@ -114,10 +120,34 @@ const AppKitEvent = extern struct {
     /// documented scale (log-spaced 50 Hz..16 kHz buckets, linear-in-dB
     /// from -60 dBFS at 0 to full scale at 255). Zeros elsewhere.
     audio_bands: [platform_mod.audio_spectrum_band_count]u8,
+    /// Video player report payload (`kind == .video`): the
+    /// `VideoEventKind` ordinal plus the player's position/duration
+    /// readout at emit time. `video_buffering` is stream-only, distinct
+    /// from `video_playing` (the transport intent) — the audio pair's
+    /// exact semantics.
+    video_kind: c_int,
+    /// The engine-minted load token this event's playback echoes (see
+    /// `platform.VideoEvent.token`).
+    video_token: u64,
+    video_position_ms: u64,
+    video_duration_ms: u64,
+    video_playing: c_int,
+    video_buffering: c_int,
+    /// `.loaded` payload: the STREAM's decoded pixel dimensions — the
+    /// honest source geometry even when the host fits frames to the
+    /// sink's pixel budget. Zeros on every other kind.
+    video_width: u64,
+    video_height: u64,
 };
 
 const AppKitCallback = *const fn (context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) void;
 const AppKitBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
+/// Where the AppKit host's video frame pump delivers decoded frames
+/// (`native_sdk_appkit_video_sink_push_t`): one tightly packed
+/// straight-alpha RGBA8 frame per call, answered 0 accepted, 1 the
+/// receiving claim was released (the host stops its frame timer),
+/// anything else one dropped frame.
+const AppKitVideoSinkPush = *const fn (context: ?*anyopaque, width: usize, height: usize, pixels: [*c]const u8, len: usize) callconv(.c) c_int;
 
 const shortcut_modifier_primary: u32 = 1 << 0;
 const shortcut_modifier_command: u32 = 1 << 1;
@@ -131,6 +161,7 @@ extern fn native_sdk_appkit_set_dock_icon_rgba(host: *AppKitHost, pixels: [*]con
 extern fn native_sdk_appkit_set_dock_icon_file(host: *AppKitHost, path: [*]const u8, path_len: usize) void;
 extern fn native_sdk_appkit_run(host: *AppKitHost, callback: AppKitCallback, context: ?*anyopaque) void;
 extern fn native_sdk_appkit_stop(host: *AppKitHost) void;
+extern fn native_sdk_appkit_request_stop(host: *AppKitHost) void;
 extern fn native_sdk_appkit_load_webview(host: *AppKitHost, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_appkit_load_window_webview(host: *AppKitHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_appkit_set_bridge_callback(host: *AppKitHost, callback: AppKitBridgeCallback, context: ?*anyopaque) void;
@@ -147,6 +178,8 @@ extern fn native_sdk_appkit_set_window_content_min_size(host: *AppKitHost, windo
 extern fn native_sdk_appkit_focus_window(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_close_window(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_minimize_window(host: *AppKitHost, window_id: u64) c_int;
+extern fn native_sdk_appkit_show_window(host: *AppKitHost, window_id: u64) c_int;
+extern fn native_sdk_appkit_set_window_close_policy(host: *AppKitHost, window_id: u64, close_policy: c_int) c_int;
 extern fn native_sdk_appkit_set_window_user_script(host: *AppKitHost, window_id: u64, script: [*]const u8, script_len: usize) c_int;
 extern fn native_sdk_appkit_set_pending_window_overlay(host: *AppKitHost, window_id: u64, transparent: c_int, shadow: c_int, level: c_int, click_through: c_int, all_workspaces: c_int, visible: c_int, activate: c_int) c_int;
 extern fn native_sdk_appkit_configure_window_overlay(host: *AppKitHost, window_id: u64, transparent: c_int, shadow: c_int, level: c_int, click_through: c_int, all_workspaces: c_int) c_int;
@@ -168,7 +201,7 @@ extern fn native_sdk_appkit_adopt_view_surface(host: *AppKitHost, window_id: u64
 extern fn native_sdk_appkit_release_view_surface(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
 extern fn native_sdk_appkit_request_gpu_surface_frame(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
 extern fn native_sdk_appkit_note_gpu_surface_input(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
-extern fn native_sdk_appkit_set_gpu_surface_scroll_drivers(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, drivers: [*]const AppKitScrollDriver, count: usize) c_int;
+extern fn native_sdk_appkit_set_gpu_surface_scroll_drivers(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, drivers: [*]const AppKitScrollDriver, count: usize, occluders: [*]const AppKitScrollOccluder, occluder_count: usize) c_int;
 extern fn native_sdk_appkit_show_context_menu(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, x: f64, y: f64, token: u64, items: [*]const AppKitContextMenuItem, count: usize) c_int;
 extern fn native_sdk_appkit_start_timer(host: *AppKitHost, timer_id: u64, interval_ns: u64, repeats: c_int) void;
 extern fn native_sdk_appkit_cancel_timer(host: *AppKitHost, timer_id: u64) void;
@@ -179,6 +212,15 @@ extern fn native_sdk_appkit_audio_pause(host: *AppKitHost) c_int;
 extern fn native_sdk_appkit_audio_stop(host: *AppKitHost) c_int;
 extern fn native_sdk_appkit_audio_seek(host: *AppKitHost, position_ms: u64) c_int;
 extern fn native_sdk_appkit_audio_set_volume(host: *AppKitHost, volume: f64) c_int;
+extern fn native_sdk_appkit_video_load(host: *AppKitHost, path: [*]const u8, path_len: usize, token: u64, push_fn: AppKitVideoSinkPush, push_context: ?*anyopaque) c_int;
+extern fn native_sdk_appkit_video_load_url(host: *AppKitHost, url: [*]const u8, url_len: usize, token: u64, push_fn: AppKitVideoSinkPush, push_context: ?*anyopaque) c_int;
+extern fn native_sdk_appkit_video_play(host: *AppKitHost) c_int;
+extern fn native_sdk_appkit_video_pause(host: *AppKitHost) c_int;
+extern fn native_sdk_appkit_video_stop(host: *AppKitHost) c_int;
+extern fn native_sdk_appkit_video_seek(host: *AppKitHost, position_ms: u64) c_int;
+extern fn native_sdk_appkit_video_set_volume(host: *AppKitHost, volume: f64) c_int;
+extern fn native_sdk_appkit_video_set_muted(host: *AppKitHost, muted: c_int) c_int;
+extern fn native_sdk_appkit_video_set_loop(host: *AppKitHost, loop: c_int) c_int;
 extern fn native_sdk_appkit_wake(host: *AppKitHost) void;
 extern fn native_sdk_appkit_present_gpu_surface_pixels(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, width: usize, height: usize, scale: f64, has_dirty_rect: c_int, dirty_x: f64, dirty_y: f64, dirty_width: f64, dirty_height: f64, rgba8: [*]const u8, rgba8_len: usize) c_int;
 extern fn native_sdk_appkit_present_gpu_surface_packet(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, surface_width: f64, surface_height: f64, scale: f64, clear_r: u8, clear_g: u8, clear_b: u8, clear_a: u8, requires_render: c_int, command_count: usize, unsupported_command_count: usize, representable: c_int, json: [*]const u8, json_len: usize) c_int;
@@ -195,7 +237,8 @@ extern fn native_sdk_appkit_close_webview(host: *AppKitHost, window_id: u64, lab
 extern fn native_sdk_appkit_clipboard_read(host: *AppKitHost, buffer: [*]u8, buffer_len: usize) usize;
 extern fn native_sdk_appkit_measure_text(font_id: u64, size: f64, text: [*]const u8, text_len: usize) f64;
 extern fn native_sdk_appkit_measure_text_advances(font_id: u64, size: f64, text: [*]const u8, text_len: usize, advances: [*]f32) c_int;
-extern fn native_sdk_appkit_register_font(font_id: u64, bytes: [*]const u8, bytes_len: usize) c_int;
+extern fn native_sdk_appkit_register_font(font_id: u64, bytes: [*]const u8, bytes_len: usize, out_token: *u64) c_int;
+extern fn native_sdk_appkit_unregister_font(font_id: u64, token: u64) c_int;
 extern fn native_sdk_appkit_register_bundled_fonts() void;
 extern fn native_sdk_appkit_decode_image(bytes: [*]const u8, bytes_len: usize, pixels: [*]u8, pixels_len: usize, out_width: *usize, out_height: *usize) c_int;
 extern fn native_sdk_appkit_clipboard_write(host: *AppKitHost, text: [*]const u8, text_len: usize) void;
@@ -210,17 +253,30 @@ extern fn native_sdk_appkit_set_credential(host: *AppKitHost, service: [*]const 
 extern fn native_sdk_appkit_get_credential(host: *AppKitHost, service: [*]const u8, service_len: usize, account: [*]const u8, account_len: usize, buffer: [*]u8, buffer_len: usize) usize;
 extern fn native_sdk_appkit_delete_credential(host: *AppKitHost, service: [*]const u8, service_len: usize, account: [*]const u8, account_len: usize) c_int;
 
+const AppKitScrollOccluder = extern struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+};
+
 const AppKitScrollDriver = extern struct {
     driver_id: u64,
+    parent_driver_id: u64,
+    occluder_mask: u32,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
     content_width: f64,
     content_height: f64,
+    offset_x: f64,
     offset_y: f64,
-    set_offset: c_int,
+    set_offset_x: c_int,
+    set_offset_y: c_int,
     rubber_band: c_int,
+    scrolls_x: c_int,
+    scrolls_y: c_int,
 };
 
 const AppKitContextMenuItem = extern struct {
@@ -517,6 +573,25 @@ pub const MacPlatform = struct {
     app_info: platform_mod.AppInfo,
     surface_value: platform_mod.Surface,
     state: RunState = .{},
+    /// Latched when the runtime's effects teardown abandons an
+    /// in-flight channel `wake_fn` call (see
+    /// `PlatformServices.note_channel_wake_abandoned_fn`): the stale
+    /// call still holds this platform as its context and may execute
+    /// into it at any later time, so `deinit` must skip destruction
+    /// and leak the host, process-lived — and the wrapper struct the
+    /// context actually points at (the wake thunk casts to
+    /// `*MacPlatform` before reaching the host) must outlive the call
+    /// too, which is why runners allocate it through
+    /// `createWithOptions` and retire it through `destroy`, the
+    /// latch-gated free.
+    channel_wake_abandoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The CURRENT video frame sink — the host's C push trampoline
+    /// cannot carry a Zig error-union fn pointer, so the sink lives
+    /// here and `nativeSdkVideoSinkPush` forwards through it. Single
+    /// player, single slot: loads replace it on the main thread, and
+    /// every push happens on the main thread (the host's frame pump is
+    /// a run-loop timer), so a plain field is race-free.
+    video_sink: platform_mod.VideoFrameSink = .{},
 
     pub fn init(title: []const u8, size: geometry.SizeF) Error!MacPlatform {
         return initWithEngine(title, size, .system);
@@ -553,6 +628,11 @@ pub const MacPlatform = struct {
         // (AppKit `contentMinSize`); the create call above registers
         // the window under its id, so the floor applies right after.
         applyWindowContentMinSize(host, window_options.id, window_options.min_width, window_options.min_height);
+        // Same timing for the declared close policy: the manifest's
+        // .hide threads through here so the STARTUP window's red
+        // button hides from the first frame on.
+        applyWindowClosePolicy(host, window_options.id, window_options.close_policy);
+
         // The startup window exists before any overlay config could be
         // staged, but it is not ordered front until the run loop starts —
         // configuring it here is still flash-free. (visible/activate are
@@ -573,7 +653,44 @@ pub const MacPlatform = struct {
         };
     }
 
+    /// Heap-allocate the wrapper (process allocator) and initialize it
+    /// in place. Runners must use this over a stack `initWithOptions`
+    /// value: `platform().services.context` is this wrapper's ADDRESS,
+    /// worker threads dereference it inside the channel wake path, and
+    /// a wake call teardown abandons may do so at any later time —
+    /// after a runner's stack frame would have unwound. Pair with
+    /// `destroy`, the latch-gated free.
+    pub fn createWithOptions(size: geometry.SizeF, web_engine: platform_mod.WebEngine, app_info: platform_mod.AppInfo) Error!*MacPlatform {
+        const self = std.heap.page_allocator.create(MacPlatform) catch return error.CreateFailed;
+        errdefer std.heap.page_allocator.destroy(self);
+        self.* = try initWithOptions(size, web_engine, app_info);
+        return self;
+    }
+
+    /// `deinit` plus the wrapper's own storage, gated by the same
+    /// latch: an abandoned channel wake call dereferences this wrapper
+    /// (its context) BEFORE it reaches the native host, so on abandon
+    /// both are leaked, process-lived — deinit-gating extended to
+    /// lifetime-gating, the honest completion of the abandoned-worker
+    /// idiom. No cross-thread race on the gate: the latch is set
+    /// synchronously on the loop thread during effects teardown, which
+    /// runs before the runner's deferred destroy.
+    pub fn destroy(self: *MacPlatform) void {
+        self.deinit();
+        if (self.channel_wake_abandoned.load(.seq_cst)) return;
+        std.heap.page_allocator.destroy(self);
+    }
+
     pub fn deinit(self: *MacPlatform) void {
+        // An abandoned channel wake call may still enter this host at
+        // any later time (see `channel_wake_abandoned`): destroying it
+        // would turn that stale call into a use-after-free, so the
+        // host is deliberately leaked, process-lived — the
+        // abandoned-worker idiom, applied to the platform itself.
+        if (self.channel_wake_abandoned.load(.seq_cst)) {
+            std.debug.print("macos platform teardown: an abandoned channel wake call may still enter this host; skipping destruction and leaking it (and the wrapper it enters through), process-lived, so the stale call stays safe\n", .{});
+            return;
+        }
         native_sdk_appkit_destroy(self.host);
     }
 
@@ -599,6 +716,8 @@ pub const MacPlatform = struct {
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
                 .minimize_window_fn = minimizeWindow,
+                .show_window_fn = showWindow,
+                .quit_app_fn = quitApp,
                 .set_window_frame_fn = setWindowFrame,
                 .set_window_visible_fn = setWindowVisible,
                 .set_window_click_through_fn = setWindowClickThrough,
@@ -649,7 +768,17 @@ pub const MacPlatform = struct {
                 .audio_stop_fn = audioStop,
                 .audio_seek_fn = audioSeek,
                 .audio_set_volume_fn = audioSetVolume,
+                .video_load_fn = videoLoad,
+                .video_load_url_fn = videoLoadUrl,
+                .video_play_fn = videoPlay,
+                .video_pause_fn = videoPause,
+                .video_stop_fn = videoStop,
+                .video_seek_fn = videoSeek,
+                .video_set_volume_fn = videoSetVolume,
+                .video_set_muted_fn = videoSetMuted,
+                .video_set_loop_fn = videoSetLoop,
                 .wake_fn = wake,
+                .note_channel_wake_abandoned_fn = noteChannelWakeAbandoned,
                 .request_frame_fn = requestFrame,
                 .request_gpu_surface_frame_fn = requestGpuSurfaceFrame,
                 .note_gpu_surface_input_fn = noteGpuSurfaceInput,
@@ -661,6 +790,7 @@ pub const MacPlatform = struct {
                 .upload_gpu_surface_image_fn = uploadGpuSurfaceImage,
                 .remove_gpu_surface_image_fn = removeGpuSurfaceImage,
                 .register_gpu_surface_font_fn = registerGpuSurfaceFont,
+                .unregister_gpu_surface_font_fn = unregisterGpuSurfaceFont,
                 .update_widget_accessibility_fn = updateWidgetAccessibility,
                 .measure_text_fn = measureText,
                 .measure_text_advances_fn = measureTextAdvances,
@@ -686,6 +816,10 @@ pub const MacPlatform = struct {
             .recent_documents,
             .credentials,
             .app_activation_events,
+            // close_policy .hide: windowShouldClose orders the window
+            // out instead of closing, the Dock reopen re-shows it —
+            // both hosts (AppKit and the CEF variant) implement it.
+            .window_hide_on_close,
             => true,
             .context_menus => true,
             .native_views,
@@ -706,6 +840,12 @@ pub const MacPlatform = struct {
             .audio_streaming,
             .audio_spectrum,
             => self.web_engine == .system,
+            // AVFoundation video ships in the AppKit host only (one
+            // AVPlayer whose AVPlayerItemVideoOutput frames feed the
+            // media-surface sink); the CEF host stubs the C ABI and
+            // reports honestly unsupported rather than half-implementing
+            // a second player.
+            .video_playback => self.web_engine == .system,
         };
     }
 
@@ -790,8 +930,13 @@ fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) 
                 .scale_factor = @floatCast(event.scale),
                 .open = event.open != 0,
                 .focused = event.focused != 0,
+                .hidden = event.hidden != 0,
             } });
         },
+        .view_focused => state.emit(.{ .view_focused = .{
+            .window_id = event.window_id,
+            .label = event.view_label[0..event.view_label_len],
+        } }),
         .shortcut => state.emit(.{ .shortcut = .{
             .id = event.shortcut_id[0..event.shortcut_id_len],
             .key = event.shortcut_key[0..event.shortcut_key_len],
@@ -852,6 +997,7 @@ fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) 
             .window_id = event.window_id,
             .label = event.view_label[0..event.view_label_len],
             .driver_id = event.widget_id,
+            .offset_x = @floatCast(event.scroll_driver_offset_x),
             .offset_y = @floatCast(event.scroll_driver_offset_y),
             .timestamp_ns = event.timestamp_ns,
         } }),
@@ -868,6 +1014,16 @@ fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) 
             .playing = event.audio_playing != 0,
             .buffering = event.audio_buffering != 0,
             .bands = event.audio_bands,
+        } }),
+        .video => state.emit(.{ .video = .{
+            .kind = videoEventKindFromInt(event.video_kind),
+            .token = event.video_token,
+            .position_ms = event.video_position_ms,
+            .duration_ms = event.video_duration_ms,
+            .playing = event.video_playing != 0,
+            .buffering = event.video_buffering != 0,
+            .width = event.video_width,
+            .height = event.video_height,
         } }),
         .widget_accessibility_action => if (widgetAccessibilityActionFromInt(event.widget_action)) |action| {
             state.emit(.{ .widget_accessibility_action = .{
@@ -912,6 +1068,18 @@ fn audioEventKindFromInt(value: c_int) platform_mod.AudioEventKind {
     };
 }
 
+/// Ordinals match `native_sdk_appkit_video_event_kind_t` in
+/// appkit_host.h; anything unknown degrades to `.failed` so a host/SDK
+/// skew is loud in the app instead of undefined behavior here.
+fn videoEventKindFromInt(value: c_int) platform_mod.VideoEventKind {
+    return switch (value) {
+        0 => .loaded,
+        1 => .position,
+        2 => .completed,
+        else => .failed,
+    };
+}
+
 fn gpuSurfaceInputEventFromAppKitEvent(event: *const AppKitEvent) platform_mod.GpuSurfaceInputEvent {
     return .{
         .window_id = event.window_id,
@@ -927,6 +1095,9 @@ fn gpuSurfaceInputEventFromAppKitEvent(event: *const AppKitEvent) platform_mod.G
         .text = event.input_text[0..event.input_text_len],
         .composition_cursor = if (event.has_composition_cursor != 0) event.composition_cursor else null,
         .modifiers = shortcutModifiersFromFlags(event.shortcut_modifiers),
+        // The pinch magnification delta rides the ABI event's `scale`
+        // field (zero on every non-pinch input emission).
+        .scale = @floatCast(event.scale),
     };
 }
 
@@ -950,6 +1121,16 @@ pub fn installHeadlessTextServices(services: *platform_mod.PlatformServices) voi
     services.measure_text_fn = measureText;
     services.measure_text_advances_fn = measureTextAdvances;
     services.register_gpu_surface_font_fn = registerGpuSurfaceFont;
+    services.unregister_gpu_surface_font_fn = unregisterGpuSurfaceFont;
+}
+
+/// Headless image codec for session replay: the SAME CGImageSource
+/// decode a live host serves (see `decodeImage` below — a context-free
+/// bytes-to-pixels call, no window, no run loop), so journaled image
+/// bytes re-register the identical pixels under a headless replay on
+/// the same platform.
+pub fn installHeadlessImageCodec(services: *platform_mod.PlatformServices) void {
+    services.decode_image_fn = decodeImage;
 }
 
 fn measureText(context: ?*anyopaque, font_id: u64, size: f32, text: []const u8) f32 {
@@ -1079,6 +1260,22 @@ fn windowHasOverlayOptions(options: platform_mod.WindowOptions) bool {
         !options.activate;
 }
 
+fn closePolicyInt(policy: platform_mod.WindowClosePolicy) c_int {
+    return switch (policy) {
+        .quit => 0,
+        .hide => 1,
+    };
+}
+
+/// Register a window's declared close policy with the host, right
+/// after create (the min-size-floor pattern: close handling is host
+/// window state fixed for the window's life). `.quit` skips the call —
+/// it IS the host default.
+fn applyWindowClosePolicy(host: *AppKitHost, window_id: u64, policy: platform_mod.WindowClosePolicy) void {
+    if (policy == .quit) return;
+    _ = native_sdk_appkit_set_window_close_policy(host, window_id, closePolicyInt(policy));
+}
+
 /// Apply a declared content min-size floor to a created window
 /// (AppKit `contentMinSize`). Zero/negative/non-finite floors are the
 /// "no floor" sentinel and skip the call — the window keeps AppKit's
@@ -1108,6 +1305,7 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
     }
     if (native_sdk_appkit_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), showModeInt(options.show)) == 0) return error.CreateFailed;
     applyWindowContentMinSize(self.host, options.id, options.min_width, options.min_height);
+    applyWindowClosePolicy(self.host, options.id, options.close_policy);
     return .{
         .id = options.id,
         .label = options.label,
@@ -1165,6 +1363,28 @@ fn screenWorkArea(context: ?*anyopaque) geometry.RectF {
     var height: f64 = 0;
     if (native_sdk_appkit_screen_work_area(self.host, &x, &y, &width, &height) == 0) return geometry.RectF.init(0, 0, 0, 0);
     return geometry.RectF.init(@floatCast(x), @floatCast(y), @floatCast(width), @floatCast(height));
+}
+
+fn showWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (native_sdk_appkit_show_window(self.host, window_id) == 0) return error.WindowNotFound;
+}
+
+/// The graceful quit: the same emitShutdown + stop the last-window
+/// close runs, ALWAYS deferred past the dispatch that requested it —
+/// this verb arrives mid dispatch (the command whose update returned
+/// it is still being dispatched), and `app_shutdown` must emit only
+/// after that dispatch returns, or a recording session seals its
+/// journal before the requesting command commits (the command record
+/// is lost and replay diverges). While the run loop is live the host
+/// queues one loop turn; before [NSApp run] (a quit from App.start's
+/// update, or from a boot command during the synchronous first canvas
+/// frame) it parks the request and drains it at top level — never the
+/// inline emit `native_sdk_appkit_stop` keeps for the host-side
+/// failed-START request.
+fn quitApp(context: ?*anyopaque) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    native_sdk_appkit_request_stop(self.host);
 }
 
 fn startWindowDrag(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
@@ -1378,11 +1598,103 @@ fn audioSetVolume(context: ?*anyopaque, volume: f32) anyerror!void {
     _ = native_sdk_appkit_audio_set_volume(self.host, volume);
 }
 
-/// Thread-safe: dispatches onto the main queue, which emits `.wake` on
-/// the AppKit run loop. One of the two services worker threads may call.
+/// The C-callable bridge for `VideoFrameSink.push`: the sink's `push_fn`
+/// is a Zig-calling-convention error-union fn the host cannot invoke, so
+/// the host is handed this trampoline (context = the `MacPlatform`) and
+/// it forwards through the platform's current sink. Answers 0 accepted,
+/// 1 when the claim reports `error.MediaSurfaceReleased` (the host stops
+/// its frame timer — a released claim just means stop pushing), 2 for
+/// any other refusal (one dropped frame; latest-wins).
+fn nativeSdkVideoSinkPush(context: ?*anyopaque, width: usize, height: usize, pixels: [*c]const u8, len: usize) callconv(.c) c_int {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    self.video_sink.push(width, height, pixels[0..len]) catch |err| {
+        return if (err == error.MediaSurfaceReleased) 1 else 2;
+    };
+    return 0;
+}
+
+/// Map the video host's synchronous load result: 0 loaded, 1 the file is
+/// missing/unreadable, anything else a decode failure. The asynchronous
+/// `.loaded` acknowledgment (with the stream's dimensions and duration)
+/// follows as a `.video` event on the run loop; decoded frames flow
+/// through the sink stored on the platform (see `nativeSdkVideoSinkPush`).
+fn videoLoad(context: ?*anyopaque, path: []const u8, token: u64, sink: platform_mod.VideoFrameSink) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    self.video_sink = sink;
+    return switch (native_sdk_appkit_video_load(self.host, path.ptr, path.len, token, nativeSdkVideoSinkPush, self)) {
+        0 => {},
+        1 => error.VideoSourceNotFound,
+        else => error.VideoDecodeFailed,
+    };
+}
+
+/// Map the streaming host's synchronous result: 0 a progressive stream
+/// started (the `.loaded` acknowledgment follows when the item is
+/// ready), anything else the URL itself was unusable. Network failures
+/// after this point are asynchronous and arrive as `.video`/`.failed`
+/// events.
+fn videoLoadUrl(context: ?*anyopaque, url: []const u8, token: u64, sink: platform_mod.VideoFrameSink) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    self.video_sink = sink;
+    return switch (native_sdk_appkit_video_load_url(self.host, url.ptr, url.len, token, nativeSdkVideoSinkPush, self)) {
+        0 => {},
+        else => error.InvalidVideoOptions,
+    };
+}
+
+fn videoPlay(context: ?*anyopaque) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (native_sdk_appkit_video_play(self.host) == 0) return error.InvalidVideoOptions;
+}
+
+fn videoPause(context: ?*anyopaque) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    _ = native_sdk_appkit_video_pause(self.host);
+}
+
+fn videoStop(context: ?*anyopaque) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    _ = native_sdk_appkit_video_stop(self.host);
+    self.video_sink = .{};
+}
+
+fn videoSeek(context: ?*anyopaque, position_ms: u64) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (native_sdk_appkit_video_seek(self.host, position_ms) == 0) return error.InvalidVideoOptions;
+}
+
+fn videoSetVolume(context: ?*anyopaque, volume: f32) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    _ = native_sdk_appkit_video_set_volume(self.host, volume);
+}
+
+fn videoSetMuted(context: ?*anyopaque, muted: bool) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    _ = native_sdk_appkit_video_set_muted(self.host, if (muted) 1 else 0);
+}
+
+fn videoSetLoop(context: ?*anyopaque, loop: bool) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    _ = native_sdk_appkit_video_set_loop(self.host, if (loop) 1 else 0);
+}
+
+/// Thread-safe: dispatches onto the main queue (`dispatch_async` — the
+/// enqueue-only shape the wake contract requires), which emits `.wake`
+/// on the AppKit run loop. One of the two services worker threads may
+/// call.
 fn wake(context: ?*anyopaque) anyerror!void {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     native_sdk_appkit_wake(self.host);
+}
+
+/// Teardown abandoned an in-flight channel wake call: latch the flag
+/// `deinit` consults so this host is leaked rather than destroyed (see
+/// `MacPlatform.channel_wake_abandoned`).
+fn noteChannelWakeAbandoned(context: ?*anyopaque) void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    self.channel_wake_abandoned.store(true, .seq_cst);
 }
 
 /// Thread-safe like `wake`: dispatches onto the main queue, which emits
@@ -1407,7 +1719,7 @@ fn noteGpuSurfaceInput(context: ?*anyopaque, window_id: platform_mod.WindowId, l
     _ = native_sdk_appkit_note_gpu_surface_input(self.host, window_id, label.ptr, label.len);
 }
 
-fn setGpuSurfaceScrollDrivers(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, drivers: []const platform_mod.GpuSurfaceScrollDriver) anyerror!void {
+fn setGpuSurfaceScrollDrivers(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8, drivers: []const platform_mod.GpuSurfaceScrollDriver, occluders: []const platform_mod.GpuSurfaceScrollOccluder) anyerror!void {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     if (self.web_engine != .system) return error.UnsupportedService;
     var specs: [platform_mod.max_gpu_surface_scroll_drivers]AppKitScrollDriver = undefined;
@@ -1415,18 +1727,34 @@ fn setGpuSurfaceScrollDrivers(context: ?*anyopaque, window_id: platform_mod.Wind
     for (drivers[0..count], 0..) |driver, index| {
         specs[index] = .{
             .driver_id = driver.id,
+            .parent_driver_id = driver.parent_id,
+            .occluder_mask = driver.occluder_mask,
             .x = driver.frame.x,
             .y = driver.frame.y,
             .width = driver.frame.width,
             .height = driver.frame.height,
             .content_width = driver.content_size.width,
             .content_height = driver.content_size.height,
+            .offset_x = driver.offset_x,
             .offset_y = driver.offset_y,
-            .set_offset = if (driver.set_offset) 1 else 0,
+            .set_offset_x = if (driver.set_offset_x) 1 else 0,
+            .set_offset_y = if (driver.set_offset_y) 1 else 0,
             .rubber_band = if (driver.rubber_band) 1 else 0,
+            .scrolls_x = if (driver.scrolls_x) 1 else 0,
+            .scrolls_y = if (driver.scrolls_y) 1 else 0,
         };
     }
-    if (native_sdk_appkit_set_gpu_surface_scroll_drivers(self.host, window_id, label.ptr, label.len, &specs, count) == 0) return error.ViewNotFound;
+    var occluder_specs: [platform_mod.max_gpu_surface_scroll_occluders]AppKitScrollOccluder = undefined;
+    const occluder_count = @min(occluders.len, occluder_specs.len);
+    for (occluders[0..occluder_count], 0..) |occluder, index| {
+        occluder_specs[index] = .{
+            .x = occluder.frame.x,
+            .y = occluder.frame.y,
+            .width = occluder.frame.width,
+            .height = occluder.frame.height,
+        };
+    }
+    if (native_sdk_appkit_set_gpu_surface_scroll_drivers(self.host, window_id, label.ptr, label.len, &specs, count, &occluder_specs, occluder_count) == 0) return error.ViewNotFound;
 }
 
 fn showContextMenu(context: ?*anyopaque, request: platform_mod.ContextMenuRequest) anyerror!void {
@@ -1561,10 +1889,30 @@ fn removeGpuSurfaceImage(context: ?*anyopaque, id: u64) anyerror!void {
 
 /// Registered canvas fonts feed the host's single font-resolution seam
 /// (measurement AND packet text drawing), which exists on both web
-/// engines, so this is deliberately not gated on `web_engine`.
-fn registerGpuSurfaceFont(context: ?*anyopaque, font: platform_mod.GpuSurfaceFontData) anyerror!void {
+/// engines, so this is deliberately not gated on `web_engine`. Returns
+/// the registration's ownership token: the AppKit host mints one per
+/// registration (font state there is per-process, so the token is what
+/// lets teardown remove exactly this registration under a shared id);
+/// the Chromium host retains no font state and reports 0 — nothing to
+/// own, nothing for an unregister to remove.
+fn registerGpuSurfaceFont(context: ?*anyopaque, font: platform_mod.GpuSurfaceFontData) anyerror!u64 {
     _ = context;
-    if (native_sdk_appkit_register_font(font.id, font.ttf.ptr, font.ttf.len) == 0) return error.InvalidGpuSurfaceFont;
+    var token: u64 = 0;
+    if (native_sdk_appkit_register_font(font.id, font.ttf.ptr, font.ttf.len, &token) == 0) return error.InvalidGpuSurfaceFont;
+    return token;
+}
+
+/// Teardown twin of the registration above: drop the host's per-id font
+/// state (the CoreText descriptor and its caches) when the runtime that
+/// registered the id deinits — but only while the id's current
+/// registration still carries `token`, so an older runtime's deinit
+/// never removes a face a newer runtime re-registered under the same
+/// id. Same seam as registration, so deliberately not gated on
+/// `web_engine` either; unregistering an id the host never saw, or with
+/// a stale token, is a no-op accept.
+fn unregisterGpuSurfaceFont(context: ?*anyopaque, id: u64, token: u64) anyerror!void {
+    _ = context;
+    if (native_sdk_appkit_unregister_font(id, token) == 0) return error.InvalidGpuSurfaceFont;
 }
 
 fn updateWidgetAccessibility(context: ?*anyopaque, snapshot: platform_mod.WidgetAccessibilitySnapshot) anyerror!void {
@@ -1897,6 +2245,9 @@ fn gpuSurfaceInputKindFromInt(value: c_int) platform_mod.GpuSurfaceInputKind {
         9 => .ime_commit_composition,
         10 => .ime_cancel_composition,
         11 => .pointer_cancel,
+        12 => .pinch_begin,
+        13 => .pinch_change,
+        14 => .pinch_end,
         else => .pointer_move,
     };
 }
@@ -2147,6 +2498,30 @@ test "mac platform module exports type" {
     _ = MacPlatform;
 }
 
+test "mac webview presses report the focused child label" {
+    // WKWebView owns the page's pointer stream, so the AppKit host
+    // observes the down before dispatch and emits the explicit inverse
+    // edge that blurs a sibling canvas view.
+    const host_source = @embedFile("appkit_host.m");
+    try std.testing.expect(std.mem.indexOf(u8, host_source, "NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, ".kind = NATIVE_SDK_APPKIT_EVENT_VIEW_FOCUSED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, ".view_label = label") != null);
+}
+
+test "mac Chromium webview focus reports the focused child label" {
+    // CEF's focus handler is the engine-level ownership edge: it covers
+    // pointer, keyboard, and programmatic focus without predicting from
+    // a press. A generation guard keeps a closing/replaced child from
+    // publishing its old label after runtime storage has moved on.
+    const host_source = @embedFile("cef_host.mm");
+    try std.testing.expect(std.mem.indexOf(u8, host_source, "public CefFocusHandler") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, "CefRefPtr<CefFocusHandler> GetFocusHandler() override") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, "void NativeSdkCefClient::OnGotFocus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, "webViewGeneration:webview_generation_ matchesKey:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, ".kind = NATIVE_SDK_APPKIT_EVENT_VIEW_FOCUSED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_source, "emitViewFocusedForWindowId:window_id_ label:") != null);
+}
+
 test "mac dock icon fallback renders the embedded toolkit default" {
     // The exact pipeline `defaultDockIconRenderMain` hands the host:
     // decode the embedded default and render the packaging canvas. This
@@ -2324,6 +2699,34 @@ test "mac gpu surface input maps pointer cancel" {
 
     const input = gpuSurfaceInputEventFromAppKitEvent(&event);
     try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pointer_cancel, input.kind);
+}
+
+test "mac gpu surface input maps pinch phases and carries the magnification delta" {
+    const label = "timeline-canvas";
+    var event = std.mem.zeroes(AppKitEvent);
+    event.view_label = label.ptr;
+    event.view_label_len = label.len;
+    event.input_kind = 12;
+    try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pinch_begin, gpuSurfaceInputEventFromAppKitEvent(&event).kind);
+
+    // The magnification delta rides the ABI event's `scale` field with
+    // the pointer anchor on x/y (the host's converted, top-left-origin
+    // pointer location).
+    event.input_kind = 13;
+    event.x = 160;
+    event.y = 120;
+    event.scale = 0.25;
+    const change = gpuSurfaceInputEventFromAppKitEvent(&event);
+    try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pinch_change, change.kind);
+    try std.testing.expectEqual(@as(f32, 0.25), change.scale);
+    try std.testing.expectEqual(@as(f32, 160), change.x);
+    try std.testing.expectEqual(@as(f32, 120), change.y);
+
+    event.input_kind = 14;
+    event.scale = 0;
+    const end = gpuSurfaceInputEventFromAppKitEvent(&event);
+    try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pinch_end, end.kind);
+    try std.testing.expectEqual(@as(f32, 0), end.scale);
 }
 
 test "mac appearance event maps color scheme" {

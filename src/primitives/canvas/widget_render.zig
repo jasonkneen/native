@@ -87,6 +87,7 @@ const widgetAccentForegroundColor = widget_render_style.widgetAccentForegroundCo
 const widgetRadius = widget_render_style.widgetRadius;
 pub const controlRadius = widget_render_style.controlRadius;
 pub const controlStrokeWidth = widget_render_style.controlStrokeWidth;
+const snapHairlineStrokeRect = widget_render_style.snapHairlineStrokeRect;
 pub const selectControlVisualTokens = widget_render_style.selectControlVisualTokens;
 pub const textInputControlVisualTokens = widget_render_style.textInputControlVisualTokens;
 const alertControlVisualTokens = widget_render_style.alertControlVisualTokens;
@@ -112,58 +113,36 @@ pub const sliderWidgetKnobRect = widget_render_controls.sliderWidgetKnobRect;
 
 const max_widget_depth: usize = 32;
 
-/// Frame-lifetime scratch for widget-built path elements: `.chart`
-/// widgets build their line/band `PathElement`s here at emit time, and
-/// `.spinner` widgets their arc segment (unlike icons, whose elements
-/// are comptime-static); emitted commands slice into it. The event loop
-/// is single-threaded and the runtime copies the display list into
-/// per-view storage within the same emit call stack, so one threadlocal
-/// buffer per frame is sound — reset at each emit entry point. Sized to
-/// mirror the runtime's per-view path-element budget
-/// (`canvas_limits.max_canvas_path_elements_per_view`; a lockstep test
-/// keeps them equal), so overflow here fails exactly where the per-view
-/// copy would have refused anyway — loudly, by budget name.
-threadlocal var frame_path_elements: [chart_model.max_chart_path_elements_per_frame]drawing_model.PathElement = undefined;
-threadlocal var frame_path_len: usize = 0;
+// Emit-built bytes that emitted commands RETAIN live in the builder,
+// never in per-emit-reset scratch: path elements (`.chart` lines/bands,
+// the `.spinner` arc and segments, the `.checkbox` check mark — unlike
+// icons, whose elements are comptime-static) allocate from
+// `Builder.allocPathElements`, formatted chart labels from
+// `Builder.allocChartLabelBytes`, and presented single-line values from
+// `Builder.allocTextBytes`, so every emitted command's slices share the
+// builder's lifetime — a display list accumulated across several emit
+// calls, or held while another builder emits, stays intact.
 
-/// Frame-lifetime scratch for formatted chart label text (y tick values
-/// and hover-detail rows): `drawText` commands slice into it under the
-/// same single-threaded copy-before-return contract as the path
-/// elements above. Overflow fails loudly by budget name.
-threadlocal var frame_label_bytes: [chart_model.max_chart_label_bytes_per_frame]u8 = undefined;
-threadlocal var frame_label_len: usize = 0;
-
-fn resetFramePathScratch() void {
-    frame_path_len = 0;
-    frame_label_len = 0;
-}
-
-/// Persist a formatted label into the frame scratch so the emitted
-/// command outlives the local formatting buffer.
-fn allocFrameLabelBytes(text: []const u8) Error![]const u8 {
-    if (frame_label_len + text.len > frame_label_bytes.len) return error.ChartLabelBytesFull;
-    const start = frame_label_len;
-    frame_label_len += text.len;
-    @memcpy(frame_label_bytes[start..frame_label_len], text);
-    return frame_label_bytes[start..frame_label_len];
-}
+/// Transient chart scratch, lazily heap-allocated per thread: init on
+/// first chart use of a thread — the emitting thread by construction —
+/// so threads that never emit charts never allocate it. Purely
+/// intra-emit (polyline points are copied into the builder's
+/// path-element store before the emitter returns), so nothing emitted
+/// retains slices into it. The array carries no default and stays
+/// uninitialized, exactly like the `= undefined` static it replaces.
+const WidgetRenderScratch = struct {
+    chart_polyline_points: [chart_model.max_chart_points_per_series]geometry.PointF,
+};
+const widget_render_scratch = @import("lazy_tls.zig").LazyTls(WidgetRenderScratch);
 
 /// Frame-lifetime scratch (same single-threaded emit contract as the
-/// path-element scratch above) holding the root bounds of the tree being
+/// label scratch above) holding the root bounds of the tree being
 /// emitted: the rect a modal surface's scrim covers. Chrome emission
 /// happens deep in the recursion where no ancestor frame is in scope, so
 /// the entry points record it here.
 threadlocal var scrim_viewport: ?geometry.RectF = null;
 
-fn allocFramePathElements(count: usize) Error![]drawing_model.PathElement {
-    if (frame_path_len + count > frame_path_elements.len) return error.ChartPathElementListFull;
-    const start = frame_path_len;
-    frame_path_len += count;
-    return frame_path_elements[start .. start + count];
-}
-
 pub fn emitWidgetTree(builder: *Builder, widget: Widget, tokens: DesignTokens) Error!void {
-    resetFramePathScratch();
     scrim_viewport = widget.frame.normalized();
     try emitWidgetDepth(builder, widget, tokens, 0);
 }
@@ -173,7 +152,6 @@ pub fn emitWidgetLayout(builder: *Builder, layout: anytype, tokens: DesignTokens
 }
 
 pub fn emitWidgetLayoutWithState(builder: *Builder, layout: anytype, tokens: DesignTokens, state: WidgetRenderState) Error!void {
-    resetFramePathScratch();
     scrim_viewport = widgetLayoutRootBounds(layout);
     try emitWidgetLayoutChildren(builder, layout, null, tokens, state);
     try emitWidgetLayoutAnchored(builder, layout, tokens, state);
@@ -256,6 +234,8 @@ fn emitWidgetDepthContent(builder: *Builder, widget: Widget, tokens: DesignToken
         .text => try emitTextWidget(builder, paint_widget, tokens),
         .icon => try emitIconWidget(builder, paint_widget, tokens),
         .image => try emitImageWidget(builder, paint_widget),
+        .media_surface => try emitMediaSurfaceWidget(builder, paint_widget),
+        .terminal => try emitTerminalWidget(builder, paint_widget, tokens, paint_widget.state.focused),
         .avatar => try emitAvatarWidget(builder, paint_widget, tokens),
         .badge => try emitBadgeWidget(builder, paint_widget, tokens),
         .button, .toggle_button, .toggle => try widget_render_controls.emitButtonWidget(builder, paint_widget, tokens),
@@ -531,7 +511,14 @@ fn emitWidgetLayoutNodeContent(
             try builder.popClip();
             // Native scroll drivers own the (OS overlay) scrollbar.
             if (!paint_widget.native_scroll) {
-                try widget_render_scroll.emitScrollViewScrollbar(builder, paint_widget.frame, widgetScrollSemantics(layout, node_index).metrics, tokens, paint_widget.id);
+                try widget_render_scroll.emitScrollViewScrollbars(
+                    builder,
+                    paint_widget.frame,
+                    widgetScrollAxisMetrics(layout, node_index, .vertical),
+                    widgetScrollAxisMetrics(layout, node_index, .horizontal),
+                    tokens,
+                    paint_widget.id,
+                );
             }
             return;
         },
@@ -590,6 +577,8 @@ fn emitWidgetLayoutNodeContent(
         .text => try emitTextWidget(builder, paint_widget, tokens),
         .icon => try emitIconWidget(builder, paint_widget, tokens),
         .image => try emitImageWidget(builder, paint_widget),
+        .media_surface => try emitMediaSurfaceWidget(builder, paint_widget),
+        .terminal => try emitTerminalWidget(builder, paint_widget, tokens, widgetHasLogicalFocus(paint_widget, state)),
         .avatar => try emitAvatarWidget(builder, paint_widget, tokens),
         .badge => try emitBadgeWidget(builder, paint_widget, tokens),
         .button, .toggle_button, .toggle => try widget_render_controls.emitButtonWidget(builder, paint_widget, tokens),
@@ -649,9 +638,18 @@ fn emitWidgetLayoutScrollableChildren(
     try builder.pushClip(clip);
     try emitWidgetLayoutChildren(builder, layout, parent_index, tokens, state);
     try builder.popClip();
-    // Native scroll drivers own the (OS overlay) scrollbar.
+    // Native scroll drivers own the (OS overlay) scrollbar. These are
+    // the virtualized containers — vertical machinery, so only the
+    // vertical bar can exist.
     if (!widget.native_scroll) {
-        try widget_render_scroll.emitScrollViewScrollbar(builder, widget.frame, widgetScrollSemantics(layout, parent_index).metrics, tokens, widget.id);
+        try widget_render_scroll.emitScrollViewScrollbars(
+            builder,
+            widget.frame,
+            widgetScrollAxisMetrics(layout, parent_index, .vertical),
+            .{},
+            tokens,
+            widget.id,
+        );
     }
 }
 
@@ -884,7 +882,14 @@ fn emitScrollViewWidget(builder: *Builder, widget: Widget, tokens: DesignTokens,
     try builder.popClip();
     // Native scroll drivers own the (OS overlay) scrollbar.
     if (!widget.native_scroll) {
-        try widget_render_scroll.emitScrollViewScrollbar(builder, widget.frame, widget_render_scroll.widgetScrollMetricsForWidget(widget, tokens), tokens, widget.id);
+        try widget_render_scroll.emitScrollViewScrollbars(
+            builder,
+            widget.frame,
+            widget_render_scroll.widgetScrollAxisMetricsForWidget(widget, tokens, .vertical),
+            widget_render_scroll.widgetScrollAxisMetricsForWidget(widget, tokens, .horizontal),
+            tokens,
+            widget.id,
+        );
     }
 }
 
@@ -896,6 +901,16 @@ fn emitWidgetClippedChildren(builder: *Builder, widget: Widget, tokens: DesignTo
 
 fn widgetScrollSemantics(layout: anytype, node_index: usize) widget_semantics.WidgetScrollSemantics {
     return widget_semantics.widgetScrollSemantics(layout, node_index, widget_layout.virtualWidgetScrollContentExtent);
+}
+
+/// Per-axis scrollbar metrics for a layout-walk scroll region (present
+/// = false on an ungranted axis or an empty viewport).
+fn widgetScrollAxisMetrics(layout: anytype, node_index: usize, comptime axis: canvas.ScrollAxis) event_model.WidgetScrollMetrics {
+    if (node_index >= layout.nodes.len) return .{};
+    const node = layout.nodes[node_index];
+    const viewport = node.frame.inset(node.widget.layout.padding).normalized();
+    if (viewport.isEmpty()) return .{};
+    return widget_semantics.widgetScrollAxisMetrics(layout, node_index, widget_layout.virtualWidgetScrollContentExtent, axis, viewport);
 }
 
 fn emitWidgetLayoutClippedChildren(
@@ -1152,6 +1167,267 @@ fn emitImageWidget(builder: *Builder, widget: Widget) Error!void {
     if (clips_image) try builder.popClip();
 }
 
+/// The deterministic placeholder color a media surface paints under its
+/// texture: a muted flat fill DERIVED FROM THE SURFACE ID alone, so
+/// every renderer — and every replay, with or without a producer
+/// attached — derives the identical pixels from the identical display
+/// list. Channels land in the 0x40..0x7F band: distinct per surface,
+/// never garish, honest "no frame yet" chrome.
+pub fn mediaSurfacePlaceholderColor(surface_id: u64) Color {
+    const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&surface_id));
+    return Color.rgba8(
+        0x40 + @as(u8, @truncate(hash)) % 0x40,
+        0x40 + @as(u8, @truncate(hash >> 8)) % 0x40,
+        0x40 + @as(u8, @truncate(hash >> 16)) % 0x40,
+        0xff,
+    );
+}
+
+/// The video stream's reported dimensions for a contain-fitted media
+/// surface (`Widget.stream_size`, stamped by `Ui.stampVideoSurfaceFit`
+/// from the LOADED event's journaled report). Null until the
+/// dimensions are honestly known, so the fit math never runs on
+/// guessed or zero geometry — and only under `.contain`, the video
+/// surface's mode.
+fn mediaSurfaceStreamSize(widget: Widget) ?geometry.SizeF {
+    if (widget.image_fit != .contain) return null;
+    const size = widget.stream_size orelse return null;
+    if (size.width <= 0 or size.height <= 0) return null;
+    return size;
+}
+
+/// A letterbox bar extent below this is nothing to draw: the quad
+/// covers the frame on that axis (float wobble from centering math
+/// never conjures a phantom bar, and a full-frame quad keeps the
+/// frame's own corner radius).
+const media_surface_bar_epsilon: f32 = 0.001;
+
+/// The tight rounded-rect mask for a fitted quad inset `bar` inside a
+/// frame corner of radius `corner`: `max(0, corner - bar)`. The mask's
+/// corner circle is then INTERNALLY TANGENT to the frame's corner
+/// circle (center distance equals the radius difference exactly), so
+/// the masked quad never paints outside the surface's rounded
+/// silhouette while removing the provable minimum of picture — any
+/// smaller radius leaks square corners past the silhouette, any larger
+/// notches more picture than the silhouette demands. Bars at or past
+/// the corner radius mask nothing (0): the quad's corners sit fully
+/// inside the straight-edged part of the frame.
+fn mediaSurfaceQuadRadius(radius: Radius, bar: f32) Radius {
+    return .{
+        .top_left = @max(0, radius.top_left - bar),
+        .top_right = @max(0, radius.top_right - bar),
+        .bottom_right = @max(0, radius.bottom_right - bar),
+        .bottom_left = @max(0, radius.bottom_left - bar),
+    };
+}
+
+/// The media surface: an id-derived placeholder fill with the surface's
+/// externally produced texture composited over it. ONE display list
+/// serves both renderers — the texture rides a `draw_image` whose
+/// resource is marked `presentation_only`, so the deterministic
+/// reference renderer (goldens, screenshots, replay pixel marks) skips
+/// the draw and shows the placeholder, while live GPU/packet hosts
+/// composite the real texture. `image_id` is the SURFACE id (0 = the
+/// unbound sentinel: placeholder only, like an image leaf with id 0
+/// draws nothing).
+///
+/// CONTAIN fit is the video-surface mode (`Ui` stamps it on every
+/// surface the video channel feeds): with the stream's reported
+/// dimensions known (`Widget.stream_size`), THIS emit computes the
+/// aspect-fitted quad — centered, letterboxed/pillarboxed — so every
+/// host composites the identical geometry with no fit math of its own.
+/// The fitted shape is three commands: a BLACK fill over the whole
+/// frame at the frame's own radius (the letterbox field, so the
+/// surface silhouette is exact by construction — no per-bar corner
+/// The terminal leaf: the widget's RESOLVED grid snapshot painted
+/// through the terminal grid painter — real text runs, geometric box
+/// drawing, selection, cursor, and the scrollback thumb, clipped to the
+/// frame and degrading row-atomically under the shared per-view budgets
+/// (`terminal_grid.widget_command_reserve` and friends hold back room
+/// for the widgets around it). Unbound — no session published a grid
+/// yet — it paints the honest empty surface: the theme background under
+/// the widget's frame, so a terminal awaiting its pty reads as an empty
+/// terminal, never a hole. Focus wears the house ring like every other
+/// focusable control.
+fn emitTerminalWidget(builder: *Builder, widget: Widget, tokens: DesignTokens, focused: bool) Error!void {
+    const frame = widget.frame.normalized();
+    if (frame.isEmpty()) return;
+    if (widget.terminal.grid) |grid| {
+        // The grid text region sits inside the widget's own padding
+        // (the house inset when none is declared), on a full-bleed
+        // background — one seamless surface edge to edge.
+        const padding = widget.layout.padding;
+        const declared = padding.left + padding.top + padding.right + padding.bottom > 0;
+        const inset: geometry.InsetsF = if (declared) padding else geometry.InsetsF.all(8);
+        const content = geometry.RectF.init(
+            frame.x + inset.left,
+            frame.y + inset.top,
+            @max(0, frame.width - inset.left - inset.right),
+            @max(0, frame.height - inset.top - inset.bottom),
+        );
+        // The command budget the grid degrades against: the builder's
+        // capacity minus the reserve held back for the widgets around it.
+        // When the whole builder is smaller than that reserve (a tiny
+        // test buffer), there is no room to hold back for siblings, so
+        // the grid gets the whole capacity — flooring to 1 instead would
+        // fall under the painter's fixed prologue overhead and paint
+        // nothing at all. Capacity is never 0 here (the frame is
+        // non-empty), so this never hands the painter its unbounded (0)
+        // mode.
+        const capacity = builder.commands.len;
+        const command_budget = if (capacity > canvas.terminal_grid.widget_command_reserve)
+            capacity - canvas.terminal_grid.widget_command_reserve
+        else
+            capacity;
+        try canvas.terminal_grid.paint(grid.*, builder, .{
+            .frame = content,
+            .background_frame = frame,
+            .tokens = tokens,
+            .focused = focused,
+            .id_base = widget.id,
+            .command_budget = command_budget,
+            .text_reserve = canvas.terminal_grid.widget_text_reserve,
+            .path_reserve = canvas.terminal_grid.widget_path_reserve,
+            .glyph_budget = canvas.terminal_grid.widget_glyph_budget,
+        });
+    } else {
+        try builder.fillRect(.{
+            .id = widgetPartId(widget.id, 1),
+            .rect = frame,
+            .fill = colorFill(widget.style.background orelse tokens.colors.surface),
+        });
+    }
+    if (widget.state.focused) {
+        // The ring id must be disjoint from whatever the surface below
+        // emitted. A BOUND terminal's grid owns the painter's id space
+        // (`paintIdBase(widget.id)` spread across the u64 range), which a
+        // `widgetPartId(widget.id, 2)` ring can alias; take the ring from
+        // the painter's own reserved offset so the two never collide. The
+        // UNBOUND surface uses `widgetPartId(widget.id, 1)`, so its ring
+        // stays the adjacent part slot.
+        const ring_id = if (widget.terminal.grid != null)
+            canvas.terminal_grid.paintIdBase(widget.id) +% canvas.terminal_grid.reserved_id_offset
+        else
+            widgetPartId(widget.id, 2);
+        try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
+            .id = ring_id,
+            .rect = widget_render_style.focusRingRect(frame, tokens),
+            .radius = widget_render_style.focusRingRadius(widgetRadius(widget, 0), tokens),
+            .stroke = .{
+                .fill = widget_render_style.widgetFocusRingFill(widget, tokens),
+                .width = tokens.stroke.focus,
+            },
+        }));
+    }
+}
+
+/// approximation), the deterministic placeholder confined to the quad
+/// (goldens and replay screenshots, which skip the texture by policy,
+/// show the placeholder exactly where the picture goes, in the
+/// journaled-truth black field), and the picture quad — always the
+/// WHOLE frame at the stream's aspect (`image_src` crops do not apply
+/// here: see the coordinate-space teaching at the quad computation).
+/// Unknown dimensions (pre-LOADED) keep the plain full-frame
+/// placeholder draw: no guessed geometry, no divide-by-zero.
+fn emitMediaSurfaceWidget(builder: *Builder, widget: Widget) Error!void {
+    if (widget.image_id == 0 or widget.frame.normalized().isEmpty()) return;
+    const frame = widget.frame.normalized();
+    // The frame's EFFECTIVE corner radius: renderers clamp every corner
+    // to half the rect's short side, so the tangent-mask math below must
+    // start from the same value — an unbounded style radius (100 on a
+    // 32x16 surface) otherwise derives an inset-quad mask far past the
+    // real silhouette and renderers clamp THAT into a circular picture.
+    const radius = Radius.all(std.math.clamp(
+        widget.style.radius orelse 0,
+        0,
+        @min(frame.width, frame.height) * 0.5,
+    ));
+    // The fitted quad, computed once here: one authority for the
+    // geometry, always the STREAM's reported aspect. A declared
+    // `image_src` crop does NOT ride the fitted draw: `DrawImage.src`
+    // is adopted-TEXTURE pixel coordinates, and the video texture's
+    // size is unknowable at emit time (macOS budget-fits large decodes
+    // — a 3840x2160 stream lands as a smaller texture — so a
+    // stream-coordinate crop cannot be translated here, and forwarding
+    // it raw would sample the wrong region or nothing). Crops remain a
+    // GENERIC-producer facility in texture coordinates; the video
+    // surface always composites the whole frame.
+    const stream_size = mediaSurfaceStreamSize(widget);
+    const dst = if (stream_size) |size|
+        canvas.containDestinationRect(frame, size.width, size.height)
+    else
+        frame;
+    const draw_src = if (stream_size != null) null else widget.image_src;
+    const letterboxed = frame.height - dst.height > media_surface_bar_epsilon;
+    const pillarboxed = frame.width - dst.width > media_surface_bar_epsilon;
+    const fitted = letterboxed or pillarboxed;
+    const bar_extent = if (letterboxed)
+        (frame.height - dst.height) * 0.5
+    else if (pillarboxed)
+        (frame.width - dst.width) * 0.5
+    else
+        0;
+    const quad_radius = if (fitted) mediaSurfaceQuadRadius(radius, bar_extent) else radius;
+    if (fitted) {
+        // The letterbox field: black across the whole frame at the
+        // frame's radius — the silhouette, exactly.
+        try builder.fillRoundedRect(.{
+            .id = widgetPartId(widget.id, 1),
+            .rect = frame,
+            .radius = radius,
+            .fill = colorFill(Color.rgba8(0x00, 0x00, 0x00, 0xff)),
+        });
+        // The placeholder, confined to the quad under the picture
+        // (same tight mask, so it tracks the picture's shape).
+        try builder.fillRoundedRect(.{
+            .id = widgetPartId(widget.id, 4),
+            .rect = dst,
+            .radius = quad_radius,
+            .fill = colorFill(mediaSurfacePlaceholderColor(widget.image_id)),
+        });
+    } else {
+        try builder.fillRoundedRect(.{
+            .id = widgetPartId(widget.id, 1),
+            .rect = frame,
+            .radius = radius,
+            .fill = colorFill(mediaSurfacePlaceholderColor(widget.image_id)),
+        });
+    }
+    // Cover fit expands the drawn texture past the widget frame on one
+    // axis; the rectangular clip is what crops the overflow — exactly
+    // emitImageWidget's cover clip. The draw's own radius mask below is
+    // NOT a substitute: hosts that only mask radii paint a zero-radius
+    // cover surface outside its bounds, over its siblings. (Cover and
+    // the fitted path are mutually exclusive: stream geometry rides
+    // only `.contain` surfaces.)
+    const clips_image = widget.image_fit == .cover;
+    if (clips_image) try builder.pushClip(.{ .id = widgetPartId(widget.id, 3), .rect = frame });
+    try builder.drawImage(.{
+        .id = widgetPartId(widget.id, 2),
+        .image_id = canvas.mediaSurfaceTextureImageId(widget.image_id),
+        .src = draw_src,
+        .dst = dst,
+        .opacity = widget.image_opacity,
+        // Known geometry draws STRETCH: the quad is the fit, computed
+        // once from the reported dimensions. A
+        // second host-side contain against the real texture would open
+        // sub-pixel seams whenever a decoder's true dimensions round
+        // off the report (macOS floors scaled decode sizes); the
+        // sub-percent aspect nudge stretch absorbs is invisible, the
+        // seam is not — and any residue lands on the black field, not
+        // a colored fringe. Without known geometry the widget's own
+        // fit passes through.
+        .fit = if (stream_size != null) .stretch else widget.image_fit,
+        .sampling = widget.image_sampling,
+        // The render plan flattens clip stacks to rects, so a rounded
+        // surface masks on the draw itself (the avatar convention); a
+        // fitted quad carries the TIGHT inset mask
+        // (`mediaSurfaceQuadRadius`), tangent to the silhouette.
+        .radius = quad_radius,
+    });
+    if (clips_image) try builder.popClip();
+}
+
 fn emitAvatarWidget(builder: *Builder, widget: Widget, tokens: DesignTokens) Error!void {
     const visual = componentControlVisualTokens(widget, tokens);
     const radius = componentPillRadius(widget, visual, widget.frame.height * 0.5);
@@ -1201,7 +1477,7 @@ fn emitAvatarWidget(builder: *Builder, widget: Widget, tokens: DesignTokens) Err
         });
     }
 
-    try builder.strokeRect(.{
+    try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
         .id = widgetPartId(widget.id, 4),
         .rect = widget.frame,
         .radius = radius,
@@ -1209,7 +1485,7 @@ fn emitAvatarWidget(builder: *Builder, widget: Widget, tokens: DesignTokens) Err
             .fill = widgetBorderFill(widget, visual.border orelse tokens.colors.border),
             .width = controlStrokeWidth(widget, visual, tokens.stroke.hairline),
         },
-    });
+    }));
 }
 
 fn emitBadgeWidget(builder: *Builder, widget: Widget, tokens: DesignTokens) Error!void {
@@ -1223,7 +1499,7 @@ fn emitBadgeWidget(builder: *Builder, widget: Widget, tokens: DesignTokens) Erro
         .radius = radius,
         .fill = colorFill(badgeBackgroundColor(widget, tokens, visual)),
     });
-    try builder.strokeRect(.{
+    try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
         .id = widgetPartId(widget.id, 2),
         .rect = widget.frame,
         .radius = radius,
@@ -1231,7 +1507,7 @@ fn emitBadgeWidget(builder: *Builder, widget: Widget, tokens: DesignTokens) Erro
             .fill = widgetBorderFill(widget, badgeBorderColor(widget, tokens, visual)),
             .width = badgeStrokeWidth(widget, tokens, visual),
         },
-    });
+    }));
     const content_color = badgeTextColor(widget, tokens, visual);
     // Inline vector icon: icon-only badges center it (the stepper's
     // completed check, status chips); icon + text draws it before the
@@ -1329,7 +1605,7 @@ fn emitSplitDividerWidget(builder: *Builder, widget: Widget, tokens: DesignToken
         .fill = colorFill(line_color),
     });
     if (widget.state.focused) {
-        try builder.strokeRect(.{
+        try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
             .id = widgetPartId(widget.id, 2),
             .rect = pixelSnapGeometryRect(tokens, normalized),
             .radius = Radius.all(tokens.radius.sm),
@@ -1337,7 +1613,7 @@ fn emitSplitDividerWidget(builder: *Builder, widget: Widget, tokens: DesignToken
                 .fill = widget_render_style.widgetFocusRingFill(widget, tokens),
                 .width = tokens.stroke.focus,
             },
-        });
+        }));
     }
 }
 
@@ -1536,7 +1812,7 @@ fn emitSpinnerArc(builder: *Builder, widget: Widget, visual: ControlVisualTokens
     const delta_degrees = spinner_arc_sweep_degrees / @as(f32, @floatFromInt(segment_total));
     const kappa = (4.0 / 3.0) * @tan(std.math.degreesToRadians(delta_degrees) * 0.25) * radius;
 
-    const elements = try allocFramePathElements(1 + segment_total);
+    const elements = try builder.allocPathElements(1 + segment_total);
     const start_radians = std.math.degreesToRadians(start_degrees);
     elements[0] = .{ .verb = .move_to, .points = .{
         geometry.PointF.init(center.x + radius * @cos(start_radians), center.y + radius * @sin(start_radians)),
@@ -1622,7 +1898,7 @@ fn emitSpinnerSegments(builder: *Builder, widget: Widget, tokens: DesignTokens, 
         const f = geometry.PointF.init(inner.x - cap * v.x, inner.y - cap * v.y);
         const inner_mid = geometry.PointF.init(inner.x - cap * u.x, inner.y - cap * u.y);
 
-        const elements = try allocFramePathElements(8);
+        const elements = try builder.allocPathElements(8);
         elements[0] = .{ .verb = .move_to, .points = .{ a, geometry.PointF.zero(), geometry.PointF.zero() } };
         elements[1] = .{ .verb = .line_to, .points = .{ b, geometry.PointF.zero(), geometry.PointF.zero() } };
         elements[2] = .{ .verb = .cubic_to, .points = .{
@@ -1832,7 +2108,7 @@ fn emitChartAxisLabels(builder: *Builder, widget: Widget, tokens: DesignTokens, 
         for (0..lattice.count) |ordinal| {
             const value = lattice.value(ordinal);
             const formatted = chart_model.formatChartValue(&buffer, value, lattice.decimals);
-            const text = try allocFrameLabelBytes(formatted);
+            const text = try builder.allocChartLabelBytes(formatted);
             const width = measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, text, size);
             const line_y = chartMapY(value, domain, plot, 0);
             const top = std.math.clamp(line_y - line_height * 0.5, content.y, @max(content.y, content.maxY() - line_height));
@@ -1987,7 +2263,7 @@ fn emitChartLine(
 
     if (series.fill) {
         const base_y = chartMapY(chartBaselineValue(domain), domain, plot, 0);
-        const elements = try allocFramePathElements(points.len + 3);
+        const elements = try builder.allocPathElements(points.len + 3);
         for (points, 0..) |point, index| {
             elements[index] = .{
                 .verb = if (index == 0) .move_to else .line_to,
@@ -2004,7 +2280,7 @@ fn emitChartLine(
         });
     }
 
-    const elements = try allocFramePathElements(points.len);
+    const elements = try builder.allocPathElements(points.len);
     for (points, 0..) |point, index| {
         elements[index] = .{
             .verb = if (index == 0) .move_to else .line_to,
@@ -2035,7 +2311,7 @@ fn emitChartBand(
     const base_y = chartMapY(chartBaselineValue(domain), domain, plot, 0);
     const pair_count = @min(series.values.len, series.low.len);
     const lower_count = if (pair_count >= 2) pair_count else 2;
-    const elements = try allocFramePathElements(upper.len + lower_count + 1);
+    const elements = try builder.allocPathElements(upper.len + lower_count + 1);
     for (upper, 0..) |point, index| {
         elements[index] = .{
             .verb = if (index == 0) .move_to else .line_to,
@@ -2074,27 +2350,27 @@ fn emitChartBand(
 }
 
 /// Map a series into plot-space points, skipping non-finite values.
-/// Returned points live in a threadlocal scratch valid until the next
-/// series maps (each emitter consumes them before returning).
-threadlocal var chart_polyline_points: [chart_model.max_chart_points_per_series]geometry.PointF = undefined;
-
+/// Returned points live in per-thread scratch (`WidgetRenderScratch`)
+/// valid until the next series maps (each emitter consumes them before
+/// returning).
 fn chartPolylinePoints(
     values: []const f32,
     domain: chart_model.ChartDomain,
     plot: geometry.RectF,
     inset: f32,
 ) Error![]const geometry.PointF {
-    const count = @min(values.len, chart_polyline_points.len);
+    const points = &widget_render_scratch.get().chart_polyline_points;
+    const count = @min(values.len, points.len);
     var len: usize = 0;
     for (values[0..count], 0..) |value, index| {
         if (!std.math.isFinite(value)) continue;
-        chart_polyline_points[len] = geometry.PointF.init(
+        points[len] = geometry.PointF.init(
             chartMapX(index, count, plot, inset),
             chartMapY(value, domain, plot, inset),
         );
         len += 1;
     }
-    return chart_polyline_points[0..len];
+    return points[0..len];
 }
 
 const chart_grid_seed: u64 = 0x5eed_c4a8_0000_0001;
@@ -2322,12 +2598,12 @@ fn emitChartHoverDetail(builder: *Builder, widget: Widget, tokens: DesignTokens,
         .radius = radius,
         .fill = colorFill(tokens.colors.surface),
     });
-    try builder.strokeRect(.{
+    try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
         .id = chartCommandId(widget.id, chart_hover_seed, 0, 3),
         .rect = card,
         .radius = radius,
         .stroke = .{ .fill = colorFill(tokens.colors.border), .width = hairline },
-    });
+    }));
 
     // Title line, then one swatch/name/value row per series holding
     // this sample. Values right-align on the card's inner edge so a
@@ -2336,7 +2612,7 @@ fn emitChartHoverDetail(builder: *Builder, widget: Widget, tokens: DesignTokens,
     const line_height = size * 1.25;
     var title_buffer: [chart_model.max_chart_value_label_bytes]u8 = undefined;
     const title = chartHoverDetailTitle(data, detail.index, &title_buffer);
-    const title_text = try allocFrameLabelBytes(title);
+    const title_text = try builder.allocChartLabelBytes(title);
     var row_y = card.y + chart_detail_pad_v;
     try builder.drawText(.{
         .id = chartCommandId(widget.id, chart_hover_seed, 0, 4),
@@ -2366,7 +2642,7 @@ fn emitChartHoverDetail(builder: *Builder, widget: Widget, tokens: DesignTokens,
             .text = chartDetailRowName(series),
         });
         var value_buffer: [chart_model.max_chart_value_label_bytes]u8 = undefined;
-        const value_text = try allocFrameLabelBytes(chart_model.formatChartValue(&value_buffer, series.values[detail.index], decimals));
+        const value_text = try builder.allocChartLabelBytes(chart_model.formatChartValue(&value_buffer, series.values[detail.index], decimals));
         const value_width = measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, value_text, size);
         try builder.drawText(.{
             .id = chartCommandId(widget.id, chart_hover_row_seed, series_index, 2),
@@ -2517,6 +2793,20 @@ fn widgetWithRenderState(widget: Widget, state: WidgetRenderState) Widget {
         copy.state.pressed = copy.id != 0 and copy.id == pressed_id;
     }
     return copy;
+}
+
+/// The terminal cursor follows logical keyboard focus, not merely
+/// focus-visible: the outer ring is a modality affordance, while the
+/// filled-vs-hollow cursor answers whether typed bytes go to this pty.
+/// With no runtime state, a baked focused widget remains the static
+/// scene/test source of truth.
+fn widgetHasLogicalFocus(widget: Widget, state: WidgetRenderState) bool {
+    if (!state.keyboard_active) return false;
+    if (state.focused_id != null or state.focus_visible_id != null) {
+        const focused_id = state.focused_id orelse return false;
+        return widget.id != 0 and widget.id == focused_id;
+    }
+    return widget.state.focused;
 }
 
 fn accordionChildrenVisible(widget: Widget) bool {

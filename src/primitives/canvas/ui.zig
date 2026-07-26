@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const font_coverage = @import("font_coverage.zig");
 const geometry = @import("geometry");
 const canvas = @import("root.zig");
+const reflect = @import("ui_markup_reflect.zig");
 const ui_provenance = @import("ui_provenance.zig");
 
 const ObjectId = canvas.ObjectId;
@@ -50,6 +51,38 @@ fn warnStackContainerGap(kind: WidgetKind, gap: f32) void {
         .{@tagName(kind)},
     );
 }
+
+/// Debug-build diagnostics for scroll-axis combinations that only a
+/// DYNAMIC value can produce (markup validation already rejects the
+/// literal spellings): a horizontal grant on a virtualized region is
+/// ignored — windowed virtualization prices rows, not columns — and a
+/// `value_x` without a horizontal grant is silently inert. Warn and
+/// keep building; the runtime behavior (vertical scrolling, offset
+/// ignored) is well-defined either way.
+fn warnInertScrollAxis(kind: WidgetKind, options: ElementOptionsShape) void {
+    if (builtin.mode != .Debug) return;
+    if (kind != .scroll_view) return;
+    if (options.virtualized and options.axis != .vertical) {
+        ui_log.warn(
+            "axis={s} is ignored on a virtualized scroll: windowed virtualization prices rows, not columns, so the region scrolls vertically",
+            .{@tagName(options.axis)},
+        );
+    }
+    if (options.value_x != 0 and (options.virtualized or !options.axis.scrollsHorizontally())) {
+        ui_log.warn(
+            "value_x does nothing without a horizontal axis grant: declare axis horizontal (or both) on the scroll region, or drop the offset",
+            .{},
+        );
+    }
+}
+
+/// The slice of `ElementOptions` the scroll-axis diagnostic reads —
+/// declared outside the generic `Ui` so the warning helper can too.
+const ElementOptionsShape = struct {
+    virtualized: bool,
+    axis: canvas.ScrollAxes,
+    value_x: f32,
+};
 
 /// Debug-build diagnostic for a set `wrap` on anything but a plain text
 /// leaf. `ElementOptions.wrap` is text-leaf line policy only — rows and
@@ -95,12 +128,16 @@ fn warnTextSizeKind(kind: WidgetKind, size: canvas.WidgetSize) void {
 /// (`automate screenshot`), mobile embeds, provider-less measurement.
 /// Markup literals get the same lesson as a validation error; this
 /// diagnostic is the net for DYNAMIC strings (model-derived text
-/// reaches no static check) and Zig-authored literals. Logs the first
-/// uncovered codepoint per text run and keeps building — live macOS
-/// rendering falls back through CoreText, so this must never fail an
-/// app, and it logs at .debug (the `logAxisChildrenOverflow`
-/// precedent) because a .warn inside a test-built view would fail the
-/// whole suite for a rendering nit.
+/// reaches no static check) and Zig-authored literals. The check
+/// knows only bundled coverage — a builder has no view of the
+/// runtime's font registry — so a run whose tokens point at a
+/// registered face covering the codepoint renders real glyphs and
+/// still logs here; that imprecision is one reason this logs at
+/// .debug. Logs the first uncovered codepoint per text run and keeps
+/// building — live macOS rendering falls back through CoreText, so
+/// this must never fail an app, and .debug (the
+/// `logAxisChildrenOverflow` precedent) because a .warn inside a
+/// test-built view would fail the whole suite for a rendering nit.
 fn warnUncoveredText(kind: WidgetKind, text: []const u8) void {
     if (builtin.mode != .Debug) return;
     var index: usize = 0;
@@ -110,7 +147,7 @@ fn warnUncoveredText(kind: WidgetKind, text: []const u8) void {
         const codepoint = std.unicode.utf8Decode(text[index .. index + len]) catch return;
         if (codepoint >= 0x20 and codepoint != 0x7F and !font_coverage.covers(codepoint)) {
             ui_log.debug(
-                "{s} text contains \"{s}\" (U+{X:0>4}), outside the bundled font's coverage - it renders as a tofu box on the reference/screenshot and mobile paths; use a vector icon (icon option, <icon name>) or plain words",
+                "{s} text contains \"{s}\" (U+{X:0>4}), outside the bundled font's coverage - it renders as a tofu box on the reference/screenshot and mobile paths unless a registered font covers it; register a font (UiApp Options.fonts), use a vector icon (icon option, <icon name>), or plain words",
                 .{ @tagName(kind), text[index .. index + len], codepoint },
             );
             return;
@@ -226,6 +263,16 @@ pub const MarkupFragmentDiagnostic = struct {
 /// markup imports), or null while the fragment matches its compiled
 /// baseline. `report` carries a reloaded-but-unbuildable fragment's
 /// teaching diagnostic back to the app loop's markup diagnostic channel.
+/// The terminal grid lookup the app loop installs on the builder before
+/// each build (`Ui.terminal_lookup`): finalize resolves each `.terminal`
+/// widget's bound pty key through it to the session store's published
+/// `TerminalGrid` snapshot. Untyped context so the builder core never
+/// imports the runtime — the same seam shape as `MarkupFragmentHost`.
+pub const TerminalGridLookup = struct {
+    context: *anyopaque,
+    resolve: *const fn (context: *anyopaque, pty: u64) ?*const canvas.TerminalGrid,
+};
+
 pub const MarkupFragmentHost = struct {
     context: *anyopaque,
     override: *const fn (context: *anyopaque, key: *const anyopaque) ?*const anyopaque,
@@ -291,6 +338,22 @@ pub const UiHandlerEvent = enum {
     /// prepending a batch causes on its own, since the offset grows by
     /// the prepended extent to keep the viewport anchored.
     reach_start,
+    /// Terminal view-state changes (wheel/keyboard scrollback, the
+    /// layout-derived grid resize), dispatched with the TerminalState
+    /// the runtime already applied — echoing its `scrollback` back into
+    /// the attribute never fights the terminal reconcile rule.
+    terminal,
+    /// The pointer entered the widget's hit region (the Elm
+    /// onMouseEnter convention): a discrete containment edge the
+    /// runtime derives from the same resolution the hover wash uses,
+    /// dispatched once per entry — never per move. Every enter is
+    /// paired with an eventual `.hover_leave` while the app runs.
+    hover_enter,
+    /// The pointer left the widget's hit region — by moving out, by
+    /// the pointer leaving the window, by the widget unmounting or a
+    /// scroll/rebuild moving it out from under a stationary pointer,
+    /// or by a dismissal removing the surface under the pointer.
+    hover_leave,
 };
 
 /// A color design token referenced by name (the fields of
@@ -394,6 +457,15 @@ pub fn Ui(comptime Msg: type) type {
         /// `Tree.context_menu_fallback`. 0 (the default) synthesizes
         /// nothing.
         context_menu_fallback_target: ObjectId = 0,
+        /// The secondary click's pointer location (view-local canvas
+        /// points, the same space widget frames resolve in), set alongside
+        /// `context_menu_fallback_target`: the synthesized surface anchors
+        /// at this point — like every native context menu — instead of a
+        /// target-widget edge, so a menu opened on a wide row opens at the
+        /// click, not the row's corner. Null keeps the legacy
+        /// below-the-target anchor (a fallback opened without pointer
+        /// provenance).
+        context_menu_fallback_point: ?geometry.PointF = null,
         /// Set by `finalizeNode` when the fallback target was found and a
         /// surface was synthesized; copied onto the returned `Tree`.
         context_menu_fallback_result: ?Tree.ContextMenuFallback = null,
@@ -406,6 +478,26 @@ pub fn Ui(comptime Msg: type) type {
         /// and the seam stays untyped (`anyopaque` document pointers)
         /// so the builder core never imports the markup engine.
         markup_fragment_host: ?MarkupFragmentHost = null,
+        /// Live video playback state for the house transport chrome:
+        /// the app loop stamps the channel's snapshot here before each
+        /// build, so `video` renders honest play/pause, elapsed, and
+        /// seek state without the model carrying any of it. Defaults
+        /// (inactive) outside an app loop, where the chrome renders
+        /// disabled.
+        video_state: VideoPlaybackState = .{},
+        /// Terminal grid lookup for `.terminal` widgets: the app loop
+        /// installs it before each build, and finalize resolves every
+        /// bound pty key to the session store's published snapshot.
+        /// Null outside an app loop (bare builders, tests that stamp
+        /// grids by hand), where terminals render unbound.
+        terminal_lookup: ?TerminalGridLookup = null,
+        /// The `<video src>` declaration this build recorded (see
+        /// `video`): last-wins, mirroring `loadVideo`'s replace
+        /// semantics — one player is the whole playback surface. The
+        /// app loop reads it after the build and reconciles it into the
+        /// video channel; null means no src-bearing video was declared
+        /// (surface-only chrome declares nothing).
+        video_declaration: ?VideoDeclaration = null,
 
         pub const ElementOptions = struct {
             /// Sibling-scoped identity: the widget id hashes the parent
@@ -440,6 +532,25 @@ pub fn Ui(comptime Msg: type) type {
             text: []const u8 = "",
             placeholder: []const u8 = "",
             value: f32 = 0,
+            /// HORIZONTAL scroll offset for a horizontal-capable
+            /// `scroll` container (markup `value-x`) — the sideways
+            /// counterpart of `value`. Follows the same source-wins
+            /// reconcile rule: echo the `on_scroll` state's `offset_x`
+            /// back here and the runtime-owned offset survives
+            /// rebuilds; change it model-side to scroll
+            /// programmatically. Meaningless on every other element.
+            value_x: f32 = 0,
+            /// Which axes a `scroll` container scrolls (markup `axis`):
+            /// `.vertical` (the default — every scroll region before
+            /// axis declarations existed), `.horizontal`, or `.both`.
+            /// Horizontal grants opt the region into wheel/trackpad
+            /// `delta_x`, the bottom-edge scrollbar, and the horizontal
+            /// keymap (Left/Right lines, and on horizontal-only regions
+            /// Home/End/PageUp/PageDown too). Virtualized containers
+            /// ignore a horizontal grant — windowed virtualization
+            /// prices rows, not columns. Meaningless on non-scroll
+            /// elements.
+            axis: canvas.ScrollAxes = .vertical,
             checked: bool = false,
             selected: bool = false,
             /// Disclosure state for tree rows (`role = .treeitem`): null
@@ -454,7 +565,12 @@ pub fn Ui(comptime Msg: type) type {
             /// app registered at runtime (`Runtime.registerCanvasImage`,
             /// `fx.registerImageBytes`). 0 — the "no image" sentinel —
             /// keeps the widget on its non-image rendering (an avatar
-            /// falls back to initials).
+            /// falls back to initials). For `media_surface` this same
+            /// channel carries the SURFACE id its producer targets
+            /// (`Runtime.acquireMediaSurfaceProducer`, markup
+            /// `surface={binding}`) — the identical model-owned-u64
+            /// shape, one bit of the id space apart (see
+            /// `canvas.media_surface_image_id_bit`).
             image: canvas.ImageId = 0,
             /// Vector icon name drawn inside icon-bearing controls
             /// (`button`, `toggle_button`, `icon_button`, `list_item`,
@@ -597,6 +713,17 @@ pub fn Ui(comptime Msg: type) type {
             /// Negative (the default) declares no origin. Only
             /// meaningful with a nonzero `resize_duration`.
             resize_origin: f32 = -1,
+            /// Hover-intent show delay for an ANCHORED tooltip (markup
+            /// `tooltip-delay`), in milliseconds: the runtime shows the
+            /// tooltip only after its trigger has been hovered this
+            /// long on the recorded frame clock. 0 shows the instant
+            /// the trigger is hovered. Negative (the default) follows
+            /// the token default
+            /// (`ControlMetricTokens.tooltip_show_delay_ms`). Only
+            /// meaningful on a tooltip with `anchor` — the markup
+            /// validator rejects it anywhere else as silently-inert
+            /// data.
+            tooltip_delay: i32 = -1,
             style: canvas.WidgetStyle = .{},
             /// Named token references resolved against design tokens in
             /// `finalizeWithTokens`; explicit `style` values win.
@@ -620,6 +747,21 @@ pub fn Ui(comptime Msg: type) type {
             /// Gap in points between anchor edge and surface (`anchor`
             /// only).
             anchor_offset: f32 = 4,
+            /// The `.terminal` element's pty binding: the MODEL-OWNED
+            /// u64 effect key the app's `ptySpawn` named (markup
+            /// `pty={binding}` — ids are model data, never markup
+            /// literals). 0 is the unbound sentinel: the terminal
+            /// paints the honest empty surface. Meaningless on every
+            /// other element.
+            pty: u64 = 0,
+            /// The `.terminal` element's scrollback offset in rows
+            /// above the live screen (markup `scrollback=`), following
+            /// the scroll `value` source-wins reconcile rule: echo the
+            /// `on_terminal` state's `scrollback` back here and the
+            /// runtime-owned position survives rebuilds; change it
+            /// model-side to scroll programmatically. 0 is pinned to
+            /// the live bottom. Meaningless on every other element.
+            scrollback: u32 = 0,
             on_press: ?Msg = null,
             /// Double-click Msg (builder-only): dispatched on a release
             /// whose click count reached 2, in place of `on_press` for
@@ -671,6 +813,36 @@ pub fn Ui(comptime Msg: type) type {
             /// alternative. Like `on_press`, binding it makes the element
             /// a hit target and press claimer.
             on_hold: ?Msg = null,
+            /// Pointer hover-enter Msg (the Elm onMouseEnter
+            /// convention): dispatched once when the pointer enters
+            /// the element's hit region — a discrete containment edge,
+            /// never per move. Binding it (or `on_hover_leave`) makes
+            /// the element hover-hittable the way `on_press` makes it
+            /// pressable, WITHOUT claiming presses or painting any
+            /// hover wash — hover feedback stays with acting controls;
+            /// a quiet content tile that binds hover stays quiet.
+            /// Hover comes from mouse/trackpad pointers only; touch
+            /// input never synthesizes it.
+            on_hover_enter: ?Msg = null,
+            /// Pointer hover-leave Msg, the paired exit edge: fires
+            /// when the pointer leaves the element's hit region — by
+            /// moving out, by leaving the window, by the element
+            /// unmounting, or by a scroll/rebuild moving the element
+            /// out from under a stationary pointer (the same
+            /// resolution the hover wash uses). Every dispatched
+            /// enter is answered by exactly one eventual leave while
+            /// the app runs; the leave Msg is CAPTURED while the
+            /// element stands — payload slices deep-copied into
+            /// app-owned bytes, refreshed as rebuilds change the
+            /// binding, retained from the last build that bound one —
+            /// so an element removed (or unbound) mid-hover still
+            /// delivers its pair. The one uncapturable payload shape is
+            /// a single-item pointer, which no markup can construct — a
+            /// Zig view binding one DISABLES the pair for that element
+            /// with a warning (no enter dispatches, because its paired
+            /// leave could dangle); bind a slice or scalar payload
+            /// instead.
+            on_hover_leave: ?Msg = null,
             /// Message constructor for text edits: called with each
             /// `TextInputEvent` on text-entry widgets. Pair with `inputMsg`.
             on_input: ?InputMsgFn = null,
@@ -701,6 +873,15 @@ pub fn Ui(comptime Msg: type) type {
             /// so echoing it back into `value` on the next rebuild never
             /// fights the scroll reconcile rule.
             on_scroll: ?ScrollMsgFn = null,
+            /// Message constructor for terminal view-state changes on a
+            /// `terminal` element: called with the post-change
+            /// `canvas.TerminalState` (scrollback, history, cols, rows)
+            /// after every runtime-applied change — wheel and keyboard
+            /// scrollback, and the layout-derived grid resize. Pair
+            /// with `terminalMsg`. The delivered state is what the
+            /// runtime already applied, so echoing `scrollback` back
+            /// never fights the terminal reconcile rule.
+            on_terminal: ?TerminalMsgFn = null,
             /// Context menu for this widget: right/ctrl-click (or a touch
             /// long-press) presents these items through the platform's
             /// native menu (macOS `NSMenu`); selecting one dispatches its
@@ -725,6 +906,7 @@ pub fn Ui(comptime Msg: type) type {
         pub const ValueMsgFn = *const fn (value: f32) Msg;
         pub const LinkMsgFn = *const fn (link: []const u8) Msg;
         pub const ScrollMsgFn = *const fn (scroll: canvas.ScrollState) Msg;
+        pub const TerminalMsgFn = *const fn (state: canvas.TerminalState) Msg;
 
         pub const Node = struct {
             widget: Widget = .{ .kind = .stack },
@@ -744,12 +926,15 @@ pub fn Ui(comptime Msg: type) type {
             on_submit: ?Msg = null,
             on_dismiss: ?Msg = null,
             on_hold: ?Msg = null,
+            on_hover_enter: ?Msg = null,
+            on_hover_leave: ?Msg = null,
             on_reach_end: ?Msg = null,
             on_reach_start: ?Msg = null,
             on_input: ?InputMsgFn = null,
             on_value: ?ValueMsgFn = null,
             on_resize: ?ValueMsgFn = null,
             on_scroll: ?ScrollMsgFn = null,
+            on_terminal: ?TerminalMsgFn = null,
             context_menu: []const ContextMenuItem = &.{},
             nodes: []const Node = &.{},
             /// Markup authoring provenance, stamped by the markup engines
@@ -769,6 +954,7 @@ pub fn Ui(comptime Msg: type) type {
                 input: InputMsgFn,
                 value: ValueMsgFn,
                 scroll: ScrollMsgFn,
+                terminal: TerminalMsgFn,
                 /// Per-item context-menu messages, indexed like the
                 /// widget's `context_menu` items (null = inert entry:
                 /// separator or msg-less item).
@@ -786,12 +972,99 @@ pub fn Ui(comptime Msg: type) type {
             }.make;
         }
 
+        /// Comptime message constructor for `on_input` over a DECLARED
+        /// text-input event union (`ui_markup_reflect.declaredTextInputUnion`
+        /// — the transpiled-core shape, where the emitted module declares
+        /// its own mirror of `canvas.TextInputEvent` and type identity
+        /// cannot cross the emission boundary). The built message carries
+        /// the arm's own union value, translated field-for-field from the
+        /// runtime event at dispatch: tags map by name, numeric fields widen
+        /// the way the payload declares them (i64 or f64), and the event's
+        /// text slices ride through unchanged (host-event lifetime — one
+        /// dispatch, exactly what `update` gets everywhere else).
+        pub fn translatedInputMsg(comptime tag: std.meta.Tag(Msg), comptime Payload: type) InputMsgFn {
+            return struct {
+                fn caret(comptime D: type, direction: canvas.TextCaretDirection) D {
+                    return switch (direction) {
+                        inline else => |d| @field(D, @tagName(d)),
+                    };
+                }
+
+                fn num(comptime N: type, value: usize) N {
+                    // Saturating, not @intCast: selection offsets carry a
+                    // defined "to the end, whatever the length" sentinel —
+                    // select-all synthesizes `set_selection` with
+                    // `focus = maxInt(usize)` (events.zig), which every
+                    // consumer snaps to its text length (the runtime editor
+                    // via snapTextSelection, an elm-mirror core via its own
+                    // snap). maxInt(usize) does not fit the declared i64
+                    // field class, and panicking on translation killed the
+                    // app on the first cmd/ctrl+A (or automation set_text)
+                    // in ANY transpiled-core text field. Saturating keeps
+                    // the sentinel's meaning — still past any real length,
+                    // the core's snap resolves it exactly like the Zig
+                    // TextEditState does — and leaves real offsets exact.
+                    return if (@typeInfo(N) == .float) @floatFromInt(value) else std.math.lossyCast(N, value);
+                }
+
+                fn make(edit: canvas.TextInputEvent) Msg {
+                    const payload: Payload = switch (edit) {
+                        .insert_text => |inserted| @unionInit(Payload, "insert_text", inserted),
+                        .delete_backward => @unionInit(Payload, "delete_backward", {}),
+                        .delete_forward => @unionInit(Payload, "delete_forward", {}),
+                        .delete_word_backward => @unionInit(Payload, "delete_word_backward", {}),
+                        .delete_word_forward => @unionInit(Payload, "delete_word_forward", {}),
+                        .clear => @unionInit(Payload, "clear", {}),
+                        .move_caret => |move| blk: {
+                            const Move = @FieldType(Payload, "move_caret");
+                            break :blk @unionInit(Payload, "move_caret", .{
+                                .direction = caret(@FieldType(Move, "direction"), move.direction),
+                                .extend = move.extend,
+                            });
+                        },
+                        .set_selection => |selection| blk: {
+                            const Selection = @FieldType(Payload, "set_selection");
+                            break :blk @unionInit(Payload, "set_selection", .{
+                                .anchor = num(@FieldType(Selection, "anchor"), selection.anchor),
+                                .focus = num(@FieldType(Selection, "focus"), selection.focus),
+                            });
+                        },
+                        .set_composition => |composition| blk: {
+                            const Composition = @FieldType(Payload, "set_composition");
+                            const Cursor = @typeInfo(@FieldType(Composition, "cursor")).optional.child;
+                            break :blk @unionInit(Payload, "set_composition", .{
+                                .text = composition.text,
+                                .cursor = if (composition.cursor) |cursor| num(Cursor, cursor) else null,
+                            });
+                        },
+                        .commit_composition => @unionInit(Payload, "commit_composition", {}),
+                        .cancel_composition => @unionInit(Payload, "cancel_composition", {}),
+                    };
+                    return @unionInit(Msg, @tagName(tag), payload);
+                }
+            }.make;
+        }
+
         /// Comptime message constructor for `on_value`: `valueMsg(.confidence)`
         /// yields a function building `Msg{ .confidence = value }`.
         pub fn valueMsg(comptime tag: std.meta.Tag(Msg)) ValueMsgFn {
             return struct {
                 fn make(value: f32) Msg {
                     return @unionInit(Msg, @tagName(tag), value);
+                }
+            }.make;
+        }
+
+        /// Comptime message constructor for `on_value`/`on_resize` over a
+        /// DECLARED one-number float arm (`ui_markup_reflect.valueArmClass`
+        /// — the transpiled-core shape, where the arm's payload is the
+        /// emitted `f64` rather than `f32` by identity). The runtime's
+        /// applied 0..1 fraction widens exactly at dispatch.
+        pub fn translatedValueMsg(comptime tag: std.meta.Tag(Msg), comptime Payload: type) ValueMsgFn {
+            return struct {
+                fn make(value: f32) Msg {
+                    const payload: Payload = @floatCast(value);
+                    return @unionInit(Msg, @tagName(tag), payload);
                 }
             }.make;
         }
@@ -804,6 +1077,85 @@ pub fn Ui(comptime Msg: type) type {
             return struct {
                 fn make(scroll_state: canvas.ScrollState) Msg {
                     return @unionInit(Msg, @tagName(tag), scroll_state);
+                }
+            }.make;
+        }
+
+        /// Comptime message constructor for `on_scroll` over a DECLARED
+        /// scroll-state record (`ui_markup_reflect.declaredScrollStateRecord`
+        /// — the transpiled-core shape, where the emitted module declares
+        /// its own mirror of `canvas.ScrollState` and type identity cannot
+        /// cross the emission boundary). The built message carries the
+        /// arm's own record value, translated field-for-field from the
+        /// runtime state at dispatch: fields map by name, and each numeric
+        /// field widens the way the payload declares it (exactly into
+        /// floats, rounded to the nearest whole number into integers).
+        pub fn translatedScrollMsg(comptime tag: std.meta.Tag(Msg), comptime Payload: type) ScrollMsgFn {
+            return struct {
+                fn num(comptime N: type, value: f32) N {
+                    return if (@typeInfo(N) == .float) @floatCast(value) else @intFromFloat(@round(value));
+                }
+
+                /// The `canvas.ScrollState` field behind a payload field
+                /// name: identical for the canvas spelling, mapped for the
+                /// TS SDK spelling (`viewportExtent` — transpiled fields
+                /// keep their TS names).
+                fn sourceName(comptime name: []const u8) []const u8 {
+                    if (@hasField(canvas.ScrollState, name)) return name;
+                    inline for (reflect.scroll_state_field_names_ts, 0..) |ts_name, index| {
+                        if (comptime std.mem.eql(u8, name, ts_name)) return reflect.scroll_state_field_names[index];
+                    }
+                    unreachable; // declaredScrollStateRecord admits no other name
+                }
+
+                fn make(scroll_state: canvas.ScrollState) Msg {
+                    var payload: Payload = undefined;
+                    inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                        @field(payload, field.name) = num(field.type, @field(scroll_state, sourceName(field.name)));
+                    }
+                    return @unionInit(Msg, @tagName(tag), payload);
+                }
+            }.make;
+        }
+
+        /// Comptime message constructor for `on_terminal`:
+        /// `terminalMsg(.term_state)` yields a function building
+        /// `Msg{ .term_state = state }` from the post-change
+        /// `canvas.TerminalState`.
+        pub fn terminalMsg(comptime tag: std.meta.Tag(Msg)) TerminalMsgFn {
+            return struct {
+                fn make(state: canvas.TerminalState) Msg {
+                    return @unionInit(Msg, @tagName(tag), state);
+                }
+            }.make;
+        }
+
+        /// Comptime message constructor for `on_terminal` over a DECLARED
+        /// terminal-state record (`ui_markup_reflect.declaredTerminalStateRecord`
+        /// — the transpiled-core shape, where the emitted module declares
+        /// its own mirror of `canvas.TerminalState` and type identity
+        /// cannot cross the emission boundary). Fields map by name (the
+        /// TS spellings are identical) and each numeric field widens the
+        /// way the payload declares it.
+        pub fn translatedTerminalMsg(comptime tag: std.meta.Tag(Msg), comptime Payload: type) TerminalMsgFn {
+            return struct {
+                fn num(comptime N: type, value: anytype) N {
+                    // Saturating, never trapping: a transpiled core may
+                    // declare a field narrower than the runtime value
+                    // (`cols: u8` cannot hold the 320-column max, a
+                    // small `history` cannot hold a long scrollback), and
+                    // an `@intCast` would panic the app on the first such
+                    // report. The clamp keeps every representable value
+                    // exact and pins the rest at the field's ceiling.
+                    return if (@typeInfo(N) == .float) @floatFromInt(value) else std.math.lossyCast(N, value);
+                }
+
+                fn make(state: canvas.TerminalState) Msg {
+                    var payload: Payload = undefined;
+                    inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                        @field(payload, field.name) = num(field.type, @field(state, field.name));
+                    }
+                    return @unionInit(Msg, @tagName(tag), payload);
                 }
             }.make;
         }
@@ -907,6 +1259,17 @@ pub fn Ui(comptime Msg: type) type {
 
             /// Typed dispatch for scroll offset changes: builds the message
             /// through the widget's `on_scroll` constructor.
+            /// Terminal view-state changes route the applied state
+            /// through the widget's `on_terminal` constructor.
+            pub fn msgForTerminal(self: Tree, id: ObjectId, state: canvas.TerminalState) ?Msg {
+                for (self.handlers) |handler| {
+                    if (handler.id == id and handler.event == .terminal and handler.action == .terminal) {
+                        return handler.action.terminal(state);
+                    }
+                }
+                return null;
+            }
+
             pub fn msgForScroll(self: Tree, id: ObjectId, scroll_state: canvas.ScrollState) ?Msg {
                 for (self.handlers) |handler| {
                     if (handler.id == id and handler.event == .scroll and handler.action == .scroll) {
@@ -1018,13 +1381,34 @@ pub fn Ui(comptime Msg: type) type {
                     if (self.msgFor(target_id, .submit)) |msg| return msg;
                 }
                 if (isTextEntryWidget(widget) and !widget.state.disabled) {
-                    // The textarea newline mapping resolves BEFORE the
-                    // generic key mapping (which has no Enter case), so
-                    // the model's `on_input` hears the same newline the
-                    // runtime applied to the retained text.
-                    const edit = canvas.widgetKeyboardNewlineTextEditEvent(widget.kind, keyboard) orelse keyboard.textEditEvent();
+                    // Events routed through the runtime arrive with the
+                    // edit the retained editor actually applied STAMPED
+                    // onto `keyboard.edit` (the runtime's one derivation
+                    // seam — Escape's search-field clear, composition
+                    // cancels, and clipboard edits all ride it), and
+                    // `textEditEvent()` returns the stamp first. The
+                    // local derivation below is the fallback for events
+                    // that never crossed the runtime (direct Tree
+                    // consumers, tests); the textarea newline mapping
+                    // resolves BEFORE it because the generic key mapping
+                    // has no Enter case.
+                    const edit = if (keyboard.edit != null)
+                        keyboard.edit
+                    else
+                        canvas.widgetKeyboardNewlineTextEditEvent(widget.kind, keyboard) orelse keyboard.textEditEvent();
                     if (edit) |text_edit| {
-                        if (self.msgForTextEdit(target_id, text_edit)) |msg| return msg;
+                        // Single-line kinds sanitize the edit with the
+                        // SAME rule the runtime seam applies before
+                        // stamping (strip line breaks; suppress inserts
+                        // that strip to nothing), so the fallback
+                        // derivation for events that never crossed the
+                        // runtime can never feed a model mirror bytes
+                        // the retained editor would refuse. Stamped
+                        // edits are already sanitized and pass through
+                        // untouched.
+                        if (canvas.sanitizedSingleLineTextInputEvent(widget.kind, text_edit)) |sanitized| {
+                            if (self.msgForTextEdit(target_id, sanitized)) |msg| return msg;
+                        }
                     }
                 }
                 return null;
@@ -1053,8 +1437,10 @@ pub fn Ui(comptime Msg: type) type {
         pub fn el(self: *Self, kind: WidgetKind, options: ElementOptions, children: anytype) Node {
             if (options.on_dismiss != null) warnDismissHandlerKind(kind);
             if (options.on_resize != null) warnResizeHandlerKind(kind);
+            var widget = widgetFromOptions(kind, options);
+            if (kind == .media_surface) self.stampVideoSurfaceFit(&widget);
             return .{
-                .widget = widgetFromOptions(kind, options),
+                .widget = widget,
                 .key = options.key,
                 .global_key = options.global_key,
                 .wrap = options.wrap,
@@ -1066,12 +1452,15 @@ pub fn Ui(comptime Msg: type) type {
                 .on_submit = options.on_submit,
                 .on_dismiss = options.on_dismiss,
                 .on_hold = options.on_hold,
+                .on_hover_enter = options.on_hover_enter,
+                .on_hover_leave = options.on_hover_leave,
                 .on_reach_end = options.on_reach_end,
                 .on_reach_start = options.on_reach_start,
                 .on_input = options.on_input,
                 .on_value = options.on_value,
                 .on_resize = options.on_resize,
                 .on_scroll = options.on_scroll,
+                .on_terminal = options.on_terminal,
                 .context_menu = self.dupeContextMenuItems(options.context_menu),
                 .nodes = self.childNodes(children),
             };
@@ -1578,6 +1967,266 @@ pub fn Ui(comptime Msg: type) type {
         /// unregistered).
         pub fn image(self: *Self, options: ElementOptions) Node {
             return self.el(.image, options, .{});
+        }
+
+        /// The terminal leaf (markup `<terminal pty={key}>`): paints the
+        /// framework-owned emulator session behind the MODEL-OWNED pty
+        /// effect key in `options.pty` (the key `fx.ptySpawn` named; 0
+        /// renders the honest empty surface) and routes keys, IME text,
+        /// and wheel scrollback to it when focused. `options.scrollback`
+        /// echoes the app-visible view state back (the scroll `value`
+        /// source-wins rule) and `options.on_terminal` hears it change
+        /// (`canvas.TerminalState`). Size it like a media surface:
+        /// definite width/height or flex grow — the runtime derives the
+        /// pty's cols/rows FROM the frame the layout resolves. The text
+        /// channel is RUNTIME-OWNED (the live screen text rides it for
+        /// assistive tech and the session fingerprint): an authored
+        /// `text` would be overwritten every frame, so name the terminal
+        /// with `semantics.label` (markup `label=`, which its a11y lint
+        /// requires).
+        pub fn terminal(self: *Self, options: ElementOptions) Node {
+            return self.el(.terminal, options, .{});
+        }
+
+        /// The media surface leaf (markup `<media-surface surface={id}>`):
+        /// composites a texture PRODUCED OUTSIDE the widget tree — a
+        /// video decoder, a camera pipeline, an external renderer —
+        /// into the layout like any widget. `options.image` carries the
+        /// SURFACE id the producer targets
+        /// (`Runtime.acquireMediaSurfaceProducer`), a model-owned u64 in
+        /// the ImageId value space; 0 draws nothing (the image-leaf
+        /// convention). Until the first producer frame arrives, live
+        /// hosts show the surface's deterministic id-derived placeholder
+        /// — which is also ALL the reference renderer (goldens,
+        /// screenshots, replay pixel marks) ever shows, because texture
+        /// contents are presentation chrome by policy. Size it like an
+        /// image: definite width/height or flex grow (no intrinsic size).
+        pub fn mediaSurface(self: *Self, options: ElementOptions) Node {
+            return self.el(.media_surface, options, .{});
+        }
+
+        /// CONTAIN is the video surface's one fit mode: every media
+        /// surface the video channel feeds — the framework-owned
+        /// `<video>` surface always, an app-claimed surface while its
+        /// playback is live — letterboxes the decoded frame instead of
+        /// stretching it. Stamped on every construction path (`el` runs
+        /// this for the builder, both markup engines, and the house
+        /// `<video>` chrome), with the stream's reported dimensions
+        /// riding `Widget.stream_size` once the LOADED event has
+        /// spoken, so the emit computes the fitted quad from journaled
+        /// truth. The dimensions land ONLY on the surface the active
+        /// playback actually feeds: a source-less `<video>` shown while
+        /// a manual load targets some other surface keeps its
+        /// full-frame placeholder instead of borrowing that unrelated
+        /// stream's geometry. Camera or app-producer surfaces are
+        /// untouched: their producers own their geometry (and
+        /// `image_src` keeps its ordinary source-crop meaning).
+        fn stampVideoSurfaceFit(self: *const Self, widget: *Widget) void {
+            if (widget.image_id == 0) return;
+            const state = self.video_state;
+            const is_playback_target = state.surface != 0 and widget.image_id == state.surface;
+            if (!is_playback_target and widget.image_id != canvas.video_playback_surface_id) return;
+            widget.image_fit = .contain;
+            if (is_playback_target and state.width > 0 and state.height > 0) {
+                widget.stream_size = .{
+                    .width = @floatFromInt(state.width),
+                    .height = @floatFromInt(state.height),
+                };
+            }
+        }
+
+        /// The live playback state the house video chrome renders (see
+        /// `Ui.video_state`): what the video channel has honestly
+        /// reported, never what the model believes.
+        pub const VideoPlaybackState = struct {
+            active: bool = false,
+            playing: bool = false,
+            buffering: bool = false,
+            /// The playback reached its non-looping natural end: the
+            /// player is retired, so seeking is dead (the scrub
+            /// disables) while Play stays live — the runtime restarts
+            /// the playback from the start on it.
+            completed: bool = false,
+            position_ms: u64 = 0,
+            duration_ms: u64 = 0,
+            /// The media-surface id the ACTIVE playback feeds (0 while
+            /// none): `canvas.video_playback_surface_id` for a declared
+            /// `<video>`, the app's own id for a `loadVideo` claim. The
+            /// builder stamps CONTAIN fit on the matching surface —
+            /// video frames letterbox, never stretch.
+            surface: u64 = 0,
+            /// The stream's reported dimensions (the LOADED event's
+            /// journaled report; 0 until it lands): the geometry the
+            /// video surface's fitted draw is computed from.
+            width: u64 = 0,
+            height: u64 = 0,
+        };
+
+        /// One build's recorded `<video src>` declaration (see
+        /// `Ui.video_declaration`): the source string plus the flags
+        /// that shape a fresh load. `src` is arena-copied by `video`,
+        /// so it outlives the build exactly as long as the tree does.
+        pub const VideoDeclaration = struct {
+            src: []const u8 = "",
+            controls: bool = false,
+            autoplay: bool = true,
+            loop: bool = false,
+            muted: bool = false,
+        };
+
+        pub const VideoOptions = struct {
+            /// Playback source: an app-assets path or an http(s) URL —
+            /// the `loadVideo` cascade's resolution order. Empty
+            /// declares nothing: the element is surface-only chrome
+            /// over whatever playback the app loaded itself.
+            src: []const u8 = "",
+            /// Compose the house transport chrome (play/pause, elapsed,
+            /// seek slider, duration) under the playback surface.
+            controls: bool = false,
+            /// Start playing as soon as the load lands (the fresh
+            /// load's behavior; `loadVideo`'s default).
+            autoplay: bool = true,
+            /// Wrap from the natural end back to zero and keep playing.
+            loop: bool = false,
+            /// Start with the audio track muted.
+            muted: bool = false,
+            key: ?UiKey = null,
+            global_key: ?UiKey = null,
+            /// Definite surface width/height (same contract as
+            /// `ElementOptions.width`/`height`); the surface has no
+            /// intrinsic size, so size it definitely or flex `grow`.
+            width: f32 = 0,
+            height: f32 = 0,
+            grow: f32 = 0,
+            /// Accessible name of the playback surface (the image
+            /// leaf's alt-equivalent label rule).
+            label: []const u8 = "",
+        };
+
+        /// The video playback element (markup `<video>`): a leaf
+        /// compositing the app's SINGLE video playback — decoded
+        /// platform-side into the framework-owned playback surface
+        /// (`canvas.video_playback_surface_id`) — with optional house
+        /// transport chrome, all from existing widgets. A nonempty
+        /// `src` RECORDS the declaration on the builder (last-wins,
+        /// mirroring `loadVideo`'s replace semantics); the app loop
+        /// reconciles it into the video channel after the build, so
+        /// declaring the element IS the playback. The chrome carries no
+        /// app Msgs: its controls are stamped with `video_control`
+        /// verbs the runtime consumes directly.
+        pub fn video(self: *Self, options: VideoOptions) Node {
+            if (options.src.len > 0) {
+                const stored_src = self.arena.dupe(u8, options.src) catch {
+                    self.failed = true;
+                    return self.el(.column, .{}, .{});
+                };
+                self.video_declaration = .{
+                    .src = stored_src,
+                    .controls = options.controls,
+                    .autoplay = options.autoplay,
+                    .loop = options.loop,
+                    .muted = options.muted,
+                };
+            }
+            if (!options.controls) {
+                // Surface-only: the simplest tree — the media surface
+                // itself carries the sizing and identity.
+                return self.el(.media_surface, .{
+                    .key = options.key,
+                    .global_key = options.global_key,
+                    .image = canvas.video_playback_surface_id,
+                    .width = options.width,
+                    .height = options.height,
+                    .grow = options.grow,
+                    .semantics = .{ .label = options.label },
+                }, .{});
+            }
+            // The surface absorbs the element's height above the
+            // transport bar; the column carries the declared sizing.
+            const surface = self.el(.media_surface, .{
+                .image = canvas.video_playback_surface_id,
+                .grow = 1,
+                .semantics = .{ .label = options.label },
+            }, .{});
+            const state = self.video_state;
+            // The transport bar, styled like the house now-playing bar:
+            // one sm ghost icon button whose glyph follows playback
+            // state, fixed clip-overflow time columns (a stamp like
+            // "1:22" must never ellipsize into "1…"), and a growing
+            // seek slider. Runtime-consumed: `video_control` verbs
+            // instead of app Msgs.
+            var toggle_button = self.el(.button, .{
+                .variant = .ghost,
+                .size = .sm,
+                .icon = if (state.playing) "pause" else "play",
+                .disabled = !state.active,
+                .semantics = .{ .label = if (state.playing) "Pause" else "Play" },
+            }, .{});
+            toggle_button.widget.video_control = .toggle;
+            const elapsed = self.text(.{
+                .size = .sm,
+                .width = 46,
+                .wrap = false,
+                .overflow = .clip,
+                .style_tokens = .{ .foreground = .text_muted },
+            }, self.formatVideoTime(state.position_ms));
+            const fraction: f32 = if (state.duration_ms == 0)
+                0
+            else
+                @floatCast(@as(f64, @floatFromInt(state.position_ms)) / @as(f64, @floatFromInt(state.duration_ms)));
+            var scrub = self.el(.slider, .{
+                .grow = 1,
+                .value = fraction,
+                // A completed playback's player is retired: a seek
+                // would refuse and the thumb spring back, so the
+                // scrub disables — Play (which restarts) is the live
+                // affordance.
+                .disabled = !state.active or state.completed,
+                .semantics = .{ .label = "Seek" },
+            }, .{});
+            scrub.widget.video_control = .scrub;
+            const duration = self.text(.{
+                .size = .sm,
+                .width = 46,
+                .wrap = false,
+                .overflow = .clip,
+                .style_tokens = .{ .foreground = .text_muted },
+            }, self.formatVideoTime(state.duration_ms));
+            const controls_row = self.el(.row, .{
+                .padding = 8,
+                .gap = 8,
+                .cross = .center,
+                .style_tokens = .{ .background = .surface },
+            }, .{ toggle_button, elapsed, scrub, duration });
+            var wrap = self.el(.column, .{
+                .key = options.key,
+                .global_key = options.global_key,
+                .width = options.width,
+                .height = options.height,
+                .grow = options.grow,
+                .gap = 0,
+            }, .{ surface, controls_row });
+            // The controls-bearing form keeps the bare surface's
+            // no-intrinsic-size contract: the transport bar must never
+            // size the element (an unsized <video controls> in a hug
+            // container would otherwise render as a controls-only
+            // strip), and it clips away entirely when the layout grants
+            // the element nothing.
+            wrap.widget.layout.zero_intrinsic = true;
+            wrap.widget.layout.clip_content = true;
+            return wrap;
+        }
+
+        /// A playback time readout: h:mm:ss at an hour and beyond,
+        /// m:ss below it — the fixed-format stamp the chrome's clipped
+        /// time columns render.
+        fn formatVideoTime(self: *Self, ms: u64) []const u8 {
+            const total_seconds = ms / 1000;
+            const seconds = total_seconds % 60;
+            const minutes = (total_seconds / 60) % 60;
+            const hours = total_seconds / 3600;
+            if (hours > 0) return self.fmt("{d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds });
+            return self.fmt("{d}:{d:0>2}", .{ minutes, seconds });
         }
 
         /// A built-in vector icon leaf: `name` is one of
@@ -2273,6 +2922,13 @@ pub fn Ui(comptime Msg: type) type {
             // press, and the classic list-row shape (press to open, hold
             // for the menu) pairs the two on one element.
             if (node.on_hold != null) widget.semantics.actions.press = true;
+            // Hover family: binding either edge makes the element
+            // hover-hittable (`Widget.hover_msgs` — the chart
+            // hover-details shape, a hit target that claims no
+            // presses), never pressable: hover is not an action a
+            // screen reader can invoke, so no semantic action is
+            // stamped.
+            if (node.on_hover_enter != null or node.on_hover_leave != null) widget.hover_msgs = true;
             if (node.on_input != null) widget.semantics.actions.set_text = true;
             if (widget.kind == .slider and (node.on_value != null or node.on_change != null)) {
                 widget.semantics.actions.increment = true;
@@ -2309,6 +2965,8 @@ pub fn Ui(comptime Msg: type) type {
             appendHandler(handlers, handler_len, widget.id, .submit, node.on_submit);
             appendHandler(handlers, handler_len, widget.id, .dismiss, node.on_dismiss);
             appendHandler(handlers, handler_len, widget.id, .hold, node.on_hold);
+            appendHandler(handlers, handler_len, widget.id, .hover_enter, node.on_hover_enter);
+            appendHandler(handlers, handler_len, widget.id, .hover_leave, node.on_hover_leave);
             appendHandler(handlers, handler_len, widget.id, .reach_end, node.on_reach_end);
             appendHandler(handlers, handler_len, widget.id, .reach_start, node.on_reach_start);
             if (node.on_input) |make| {
@@ -2326,6 +2984,32 @@ pub fn Ui(comptime Msg: type) type {
             if (node.on_scroll) |make| {
                 handlers[handler_len.*] = .{ .id = widget.id, .event = .scroll, .action = .{ .scroll = make } };
                 handler_len.* += 1;
+            }
+            if (node.on_terminal) |make| {
+                handlers[handler_len.*] = .{ .id = widget.id, .event = .terminal, .action = .{ .terminal = make } };
+                handler_len.* += 1;
+            }
+            if (widget.kind == .terminal) {
+                // Resolve the bound pty's published grid snapshot (the
+                // app loop installs the lookup before each build; a
+                // bare builder has none and the widget stays unbound).
+                if (widget.terminal.pty != 0) {
+                    if (self.terminal_lookup) |lookup| {
+                        widget.terminal.grid = lookup.resolve(lookup.context, widget.terminal.pty);
+                    }
+                }
+                // The live screen text IS the terminal's semantic
+                // CONTENT: it rides the widget's text (the value the
+                // textbox exposes and the session fingerprint hashes),
+                // NOT the accessible name. The author's `label` stays
+                // the stable control NAME — clobbering it with the whole
+                // screen would rename the control after its output every
+                // frame and strand keyboard navigation. With no author
+                // label, `semanticLabel` falls back to this text, so an
+                // unnamed terminal still reads its screen.
+                if (widget.terminal.grid) |grid| {
+                    if (grid.screen_text.len > 0) widget.text = grid.screen_text;
+                }
             }
             if (node.context_menu.len > 0) {
                 // Split the declared items: labels ride the widget (the
@@ -2358,9 +3042,11 @@ pub fn Ui(comptime Msg: type) type {
         }
 
         /// Synthesize the anchored context-menu fallback surface as a
-        /// child of `widget`: a `dropdown_menu` floating below the target
-        /// with one `menu_item` per declared item (`separator`s keep
-        /// their slots). Items carry press semantics but no handler
+        /// child of `widget`: a `dropdown_menu` floating at the click
+        /// point (`context_menu_fallback_point`; below the target when no
+        /// point was recorded) with one `menu_item` per declared item
+        /// (`separator`s keep their slots). Items carry press semantics
+        /// but no handler
         /// entries — the app loop maps their presses through the
         /// target's existing `.context_menu` handler, the same entry a
         /// native selection resolves.
@@ -2394,7 +3080,16 @@ pub fn Ui(comptime Msg: type) type {
                 .semantics = .{ .label = "Context menu" },
                 .children = item_widgets,
             };
-            surface.layout.anchor = .{ .placement = .below, .alignment = .start };
+            // Anchor at the recorded click point when the request carried
+            // one (offset 0: the surface corner sits at the pointer, the
+            // native-menu convention); the widget-edge anchor remains the
+            // pointer-less floor. Either way the anchored-surface edge
+            // rules apply: flip above the anchor when the surface would
+            // cross the bottom edge, clamp into the window.
+            surface.layout.anchor = if (self.context_menu_fallback_point) |point|
+                .{ .placement = .below, .alignment = .start, .offset = 0, .point = point }
+            else
+                .{ .placement = .below, .alignment = .start };
             const children = try self.arena.alloc(Widget, widget.children.len + 1);
             @memcpy(children[0..widget.children.len], widget.children);
             children[widget.children.len] = surface;
@@ -2421,12 +3116,15 @@ pub fn Ui(comptime Msg: type) type {
             if (node.on_submit != null) total += 1;
             if (node.on_dismiss != null) total += 1;
             if (node.on_hold != null) total += 1;
+            if (node.on_hover_enter != null) total += 1;
+            if (node.on_hover_leave != null) total += 1;
             if (node.on_reach_end != null) total += 1;
             if (node.on_reach_start != null) total += 1;
             if (node.on_input != null) total += 1;
             if (node.on_value != null) total += 1;
             if (node.on_resize != null) total += 1;
             if (node.on_scroll != null) total += 1;
+            if (node.on_terminal != null) total += 1;
             if (node.context_menu.len > 0) total += 1;
             for (node.nodes) |child| total += countHandlers(child);
             return total;
@@ -2502,6 +3200,7 @@ pub fn Ui(comptime Msg: type) type {
         fn widgetFromOptions(kind: WidgetKind, options: ElementOptions) Widget {
             warnStackContainerGap(kind, options.gap);
             warnUnknownIconName(options.icon);
+            warnInertScrollAxis(kind, .{ .virtualized = options.virtualized, .axis = options.axis, .value_x = options.value_x });
             var widget: Widget = .{
                 .kind = kind,
                 .frame = options.frame,
@@ -2516,6 +3215,9 @@ pub fn Ui(comptime Msg: type) type {
                 .autofocus = options.autofocus,
                 .image_id = options.image,
                 .value = options.value,
+                .value_x = options.value_x,
+                .terminal = .{ .pty = options.pty, .scrollback = options.scrollback },
+                .scroll_axes = options.axis,
                 .variant = options.variant,
                 .size = options.size,
                 .state = .{
@@ -2562,6 +3264,7 @@ pub fn Ui(comptime Msg: type) type {
                 .resize_duration_ms = options.resize_duration,
                 .resize_easing = options.resize_easing,
                 .resize_origin = options.resize_origin,
+                .tooltip_delay_ms = options.tooltip_delay,
             };
             applyKindDefaultLayout(kind, options, &widget.layout);
             return widget;

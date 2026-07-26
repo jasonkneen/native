@@ -188,23 +188,22 @@ test "runtime applies pointer values to canvas controls" {
     _ = try harness.runtime.emitCanvasWidgetDisplayList(1, "canvas", .{});
     const display_list = try harness.runtime.canvasDisplayList(1, "canvas");
     var saw_checkbox_check = false;
-    var saw_empty_slider_active = false;
     for (display_list.commands) |command| {
         switch (command) {
-            .draw_line => |line| {
-                if (line.id == testCanvasWidgetPartId(2, 4)) saw_checkbox_check = true;
+            .stroke_path => |stroke| {
+                if (stroke.id == testCanvasWidgetPartId(2, 4)) saw_checkbox_check = true;
             },
             .fill_rounded_rect => |fill| {
-                if (fill.id == testCanvasWidgetPartId(4, 2)) {
-                    try std.testing.expectEqual(@as(f32, 0), fill.rect.width);
-                    saw_empty_slider_active = true;
-                }
+                // A slider dragged to zero paints NO active range (the
+                // zero guard the progress bar wears): a width-zero pill
+                // still owns anti-aliased edge coverage — the idle
+                // transport slider's one-pixel sliver.
+                try std.testing.expect(fill.id != testCanvasWidgetPartId(4, 2));
             },
             else => {},
         }
     }
     try std.testing.expect(saw_checkbox_check);
-    try std.testing.expect(saw_empty_slider_active);
 }
 
 test "runtime automation widget click dispatches pointer input" {
@@ -1328,8 +1327,8 @@ test "runtime refreshes widget owned display list from canvas input" {
     var saw_checkbox_check = false;
     for (display_list.commands) |command| {
         switch (command) {
-            .draw_line => |line| {
-                if (line.id == testCanvasWidgetPartId(2, 4)) saw_checkbox_check = true;
+            .stroke_path => |stroke| {
+                if (stroke.id == testCanvasWidgetPartId(2, 4)) saw_checkbox_check = true;
             },
             else => {},
         }

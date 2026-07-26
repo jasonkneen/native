@@ -37,7 +37,7 @@ pub fn RuntimeViewCanvasWidgetText(comptime RuntimeView: type) type {
             if (canvasWidgetTextEditUnchanged(current_state, next_state)) return null;
 
             try self.rewriteCanvasWidgetTextStorage(index, next_state);
-            self.scrollCanvasTextareaCaretIntoView(index);
+            self.scrollCanvasTextInputCaretIntoView(index);
             const semantics = try self.widgetLayoutTree().collectSemantics(&self.widget_semantics_nodes);
             self.widget_semantics_node_count = semantics.len;
             self.widget_revision += 1;
@@ -63,7 +63,24 @@ pub fn RuntimeViewCanvasWidgetText(comptime RuntimeView: type) type {
                 return newline_edit;
             }
 
-            if (canvasWidgetSingleLineTextKind(widget.kind) and keyboard.phase == .key_down and keyboard.text.len == 0 and !keyboard.modifiers.hasNavigationModifier()) {
+            // On a CLOSED combobox these same arrows are the trigger's
+            // OPEN keys (`widgetKeyboardControlIntent`'s menu-open
+            // mapping, which the app dispatch resolves BEFORE any
+            // stamped edit): platform convention is that opening wins
+            // and the caret does not move, so the derivation yields no
+            // edit and the retained editor agrees with the model's "no
+            // edit" verdict. The app-side fallback derivation for
+            // events that never crossed the runtime
+            // (`textEditEvent()`'s generic keymap) has no ArrowUp/Down
+            // arm at all, so both derivations stay in agreement. Once
+            // the picker is OPEN the focus step walks the arrows into
+            // the mounted menu before routing reaches the trigger; an
+            // arrow that still lands on an EXPANDED trigger (no
+            // focusable menu entry mounted) keeps the caret jump — the
+            // control resolver ignores it there, so both sides hear
+            // the same move.
+            const arrow_opens_combobox = widget.kind == .combobox and !(widget.state.expanded orelse false);
+            if (!arrow_opens_combobox and canvasWidgetSingleLineTextKind(widget.kind) and keyboard.phase == .key_down and keyboard.text.len == 0 and !keyboard.modifiers.hasNavigationModifier()) {
                 if (std.ascii.eqlIgnoreCase(keyboard.key, "arrowup")) return .{ .move_caret = .{ .direction = .start, .extend = keyboard.modifiers.shift } };
                 if (std.ascii.eqlIgnoreCase(keyboard.key, "arrowdown")) return .{ .move_caret = .{ .direction = .end, .extend = keyboard.modifiers.shift } };
             }
@@ -98,6 +115,10 @@ pub fn RuntimeViewCanvasWidgetText(comptime RuntimeView: type) type {
 
             self.widget_layout_nodes[index].widget.text_selection = next_selection;
             self.widget_layout_nodes[index].widget.text_composition = null;
+            // A pointer-placed caret is a caret change like any other: a
+            // drag past a scrolled single-line field's edge lands on an
+            // off-screen offset, and the field follows it.
+            if (canvasWidgetSingleLineTextKind(widget.kind)) self.scrollCanvasTextInputCaretIntoView(index);
             try self.refreshCanvasWidgetSemantics();
             self.widget_revision += 1;
             return self.canvasWidgetDirtyBounds(index, widget.frame);
@@ -205,10 +226,19 @@ pub fn RuntimeViewCanvasWidgetText(comptime RuntimeView: type) type {
         }
 
         /// The text a copy shortcut should place on the clipboard: the
-        /// focused editable widget's selection when it has one, else the
-        /// view's static text selection.
+        /// focused editable widget's selection or focused terminal's
+        /// emulator selection when it has one, else the view's static
+        /// text selection.
         pub fn canvasWidgetCopyText(self: *const RuntimeView) ?[]const u8 {
             if (self.canvas_widget_focused_id != 0) {
+                if (self.canvasWidgetNodeIndexById(self.canvas_widget_focused_id)) |index| {
+                    const focused = self.widget_layout_nodes[index].widget;
+                    if (!focused.state.disabled and focused.kind == .terminal) {
+                        if (focused.terminal.grid) |grid| {
+                            if (grid.selection_active) return grid.selection_text;
+                        }
+                    }
+                }
                 if (canvasWidgetSelectionSliceById(self, self.canvas_widget_focused_id, true)) |slice| return slice;
             }
             if (self.canvas_widget_selected_text_id != 0) {
@@ -266,7 +296,7 @@ pub fn RuntimeViewCanvasWidgetText(comptime RuntimeView: type) type {
                 .selection = canvas.TextSelection.collapsed(text.len),
                 .composition = null,
             });
-            self.scrollCanvasTextareaCaretIntoView(index);
+            self.scrollCanvasTextInputCaretIntoView(index);
             try self.refreshCanvasWidgetSemantics();
             self.widget_revision += 1;
             return self.canvasWidgetDirtyBounds(index, self.widget_layout_nodes[index].frame);

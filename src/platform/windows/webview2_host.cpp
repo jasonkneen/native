@@ -27,19 +27,37 @@
 #include <thread>
 #include <vector>
 
-#if __has_include(<WebView2.h>) && __has_include(<wrl.h>)
+/* NATIVE_SDK_ALLOW_WEBVIEW2_STUB is the build graph's declaration that
+ * this app uses no web layer, and it wins over header visibility: on a
+ * machine where the WebView2 SDK headers happen to be reachable through
+ * the system include paths, testing __has_include first would compile
+ * the full embedded-WebView layer into a native-only build and
+ * reintroduce the WebView2Loader.dll reference its executable must not
+ * carry (canvas apps are unaffected by the stub). Without the define the
+ * header is required: the WebView2 SDK is vendored
+ * (third_party/webview2/include) and every web-declaring build graph
+ * puts it on the include path, so a web build that cannot see it is
+ * misconfigured — fail it loudly instead of shipping a host whose
+ * WebView loads report WebViewNotFound at runtime. */
+#if defined(NATIVE_SDK_ALLOW_WEBVIEW2_STUB)
+#define NATIVE_SDK_HAS_WEBVIEW2 0
+/* Deliberately NO compiler diagnostic in this branch — not even an
+ * informational #pragma message. The stub is the expected, configured
+ * state of every native-only Windows build, and zig renders every
+ * clang diagnostic of a failing translation unit as `error:` (its
+ * serialized clang diagnostics carry no severity into the error
+ * bundle), so an informational note here masquerades as the
+ * build-killing error the moment any unrelated real error appears
+ * anywhere in this file. The teaching lives where it is actionable
+ * instead: a stubbed host reports WebViewNotFound the moment an app
+ * actually uses a WebView. */
+#elif __has_include(<WebView2.h>) && __has_include(<wrl.h>)
 #include <WebView2.h>
 #include <wrl.h>
 #define NATIVE_SDK_HAS_WEBVIEW2 1
-using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 #else
-#define NATIVE_SDK_HAS_WEBVIEW2 0
-/* Loud on purpose: without the WebView2 SDK header on the include path
- * the host builds with the embedded WebView layer stubbed out — canvas
- * apps are unaffected, but apps that load a WebView report
- * WebViewNotFound at start. */
-#pragma message("WebView2.h not found: building the Windows host without the embedded WebView layer (canvas apps unaffected; WebView loads will report WebViewNotFound)")
+#error "WebView2.h not found: add third_party/webview2/include to the include path, or define NATIVE_SDK_ALLOW_WEBVIEW2_STUB to build without the embedded WebView layer"
 #endif
 
 /* Media Foundation (the audio backend below) + WinHTTP (the audio cache
@@ -112,6 +130,8 @@ enum EventKind {
     kTimer = 16,
     kAppearance = 17,
     kAudio = 18,
+    kContextMenuAction = 19,
+    kViewFocused = 20,
 };
 
 constexpr uint32_t kShortcutModifierPrimary = 1u << 0;
@@ -143,6 +163,11 @@ constexpr UINT kAudioSessionMessage = WM_APP + 45;
  * loop starves it far below the contract cadence, while posted messages
  * keep their place in the queue. */
 constexpr UINT kAudioSpectrumMessage = WM_APP + 46;
+/* Posted by native_sdk_windows_show_context_menu (loop thread, but mid
+ * event dispatch); the window procedure presents the pending app context
+ * menu on a fresh loop turn — the same deferral the macOS host's
+ * dispatch_async performs before popUpMenuPositioningItem. */
+constexpr UINT kShowContextMenuMessage = WM_APP + 47;
 constexpr const char *kAssetVirtualOrigin = "https://native-sdk-app.localhost";
 
 constexpr int kViewWebView = 0;
@@ -175,6 +200,10 @@ struct WindowsEvent {
     double y;
     int open;
     int focused;
+    /* kWindowFrame: nonzero while the window is alive but hidden by its
+     * close_policy (.hide intercepted WM_CLOSE). open stays 1 for the
+     * window's whole hidden stretch. */
+    int hidden;
     const char *label;
     size_t label_len;
     const char *title;
@@ -224,6 +253,21 @@ struct WindowsEvent {
      * from -60 dBFS at 0 to full scale at 255). Zeros on every other
      * event kind — every emit site value-initializes the struct. */
     uint8_t audio_bands[32];
+    /* kContextMenuAction payload (the macOS host's field names):
+     * widget_id echoes the request's correlation token, menu_item_id is
+     * the selected item's id (0 = dismissed without a selection). */
+    uint64_t widget_id;
+    uint32_t menu_item_id;
+};
+
+/* One context-menu entry crossing the C ABI (the same shape the macOS
+ * host takes). */
+struct WindowsContextMenuItem {
+    uint32_t item_id;
+    const char *label;
+    size_t label_len;
+    int enabled;
+    int separator;
 };
 
 struct WindowsOpenDialogOpts {
@@ -297,6 +341,14 @@ struct Window {
      * behind the button cluster matches the app's header). */
     COLORREF hidden_caption_color = 0;
     bool hidden_caption_color_set = false;
+    /* close_policy: 0 = quit (WM_CLOSE destroys; the default), 1 = hide
+     * (WM_CLOSE hides — SW_HIDE — and the app keeps running behind its
+     * tray icon, the Win32 tray-player shape). Applied right after
+     * create via native_sdk_windows_set_window_close_policy. */
+    int close_policy = 0;
+    /* True while the .hide policy has this window off the glass; the
+     * hwnd stays live and the map entry stays owned. */
+    bool policy_hidden = false;
 };
 
 /* One rectangle of a canvas view's window-drag mirror (runtime push,
@@ -392,9 +444,21 @@ struct NativeView {
     int gpu_nonblank = 0;
     uint32_t gpu_sample_color = 0;
     int gpu_pointer_down = 0;
+    /* TrackMouseEvent(TME_LEAVE) armed for the current hover session:
+     * set on the first WM_MOUSEMOVE, cleared by the WM_MOUSELEAVE it
+     * buys, re-armed by the next move. */
+    int gpu_mouse_tracking = 0;
     double gpu_pointer_x = 0;
     double gpu_pointer_y = 0;
     WCHAR gpu_pending_high_surrogate = 0;
+    /* The WM_KEYDOWN just dispatched a registered shortcut, so every
+     * already-translated WM_CHAR trailing it belongs to the SAME
+     * keystroke and must not also type (AltGr raises Ctrl+Alt, so an
+     * AltGr chord that matches a ctrl+alt accelerator would otherwise
+     * both fire the accelerator and insert its composed text). Holds
+     * across the whole translated burst; the next WM_KEYDOWN or
+     * WM_KEYUP disarms it. */
+    bool gpu_shortcut_ate_char = false;
     /* UTF-8 preedit last sent as ime_set_composition; empty = no active
      * composition. Mirrors gpu_preedit_text in the GTK host and markedText
      * in the AppKit host. */
@@ -525,6 +589,27 @@ struct AudioState {
     std::shared_ptr<AudioDownloadCancel> download_cancel;
 };
 
+/* The one pending app context menu (menus are modal, so one at a time):
+ * copied out of the service call's borrowed request memory, presented on
+ * the next loop turn by the window procedure. */
+struct PendingContextMenu {
+    bool active = false;
+    uint64_t window_id = 0;
+    std::string view_label;
+    /* Pointer location in LOGICAL points, view-local (the same space the
+     * gpu-surface input path reports in). */
+    double x = 0;
+    double y = 0;
+    uint64_t token = 0;
+    struct Item {
+        uint32_t id = 0;
+        std::string label;
+        bool enabled = true;
+        bool separator = false;
+    };
+    std::vector<Item> items;
+};
+
 struct Host {
     HINSTANCE instance = GetModuleHandleW(nullptr);
     std::string app_name;
@@ -557,8 +642,12 @@ struct Host {
     int appearance_color_scheme = -1;
     int appearance_reduce_motion = -1;
     int appearance_high_contrast = -1;
+    /* Whether the CoInitializeEx in native_sdk_windows_create succeeded
+     * and native_sdk_windows_destroy owes the balancing CoUninitialize. */
+    bool com_initialized = false;
     AudioState audio;
     AudioSpectrumState spectrum;
+    PendingContextMenu context_menu;
     std::shared_ptr<HostLifetime> lifetime = std::make_shared<HostLifetime>();
 };
 
@@ -1124,6 +1213,20 @@ static std::string extractHtmlClipboardFragment(const std::string &payload) {
     return payload;
 }
 
+static UINT dpiForWindow(HWND hwnd);
+
+/* A Win32 top-level window keeps keyboard ownership while focus lives
+ * in any of its native child views. GetFocus() returns the CHILD HWND in
+ * that case (GPU surfaces and hosted controls alike), so direct equality
+ * with window.hwnd falsely reports the owning window blurred exactly
+ * while its child is receiving keyboard input. Walking to GA_ROOT makes
+ * the window-level flag match Win32's active focus tree. */
+static bool windowOwnsKeyboardFocus(const Window &window) {
+    if (!window.hwnd) return false;
+    HWND focused = GetFocus();
+    return focused && GetAncestor(focused, GA_ROOT) == window.hwnd;
+}
+
 static void emit(Host *host, const Window &window, EventKind kind) {
     if (!host || !host->callback) return;
     RECT rect = {};
@@ -1131,13 +1234,19 @@ static void emit(Host *host, const Window &window, EventKind kind) {
     WindowsEvent event = {};
     event.kind = kind;
     event.window_id = window.id;
-    event.width = rect.right > rect.left ? (double)(rect.right - rect.left) : window.width;
-    event.height = rect.bottom > rect.top ? (double)(rect.bottom - rect.top) : window.height;
-    event.scale = 1.0;
+    /* Window geometry crosses the runtime boundary in LOGICAL points:
+     * the client rect is physical pixels, so divide by the window's
+     * device scale. In a DPI-unaware process the reported DPI is 96 and
+     * the two units coincide, so this stays the identity there. */
+    const double scale = window.hwnd ? (double)dpiForWindow(window.hwnd) / 96.0 : 1.0;
+    event.width = rect.right > rect.left ? (double)(rect.right - rect.left) / scale : window.width;
+    event.height = rect.bottom > rect.top ? (double)(rect.bottom - rect.top) / scale : window.height;
+    event.scale = scale;
     event.x = window.x;
     event.y = window.y;
     event.open = window.hwnd != nullptr;
-    event.focused = window.hwnd && GetFocus() == window.hwnd;
+    event.focused = windowOwnsKeyboardFocus(window);
+    event.hidden = window.policy_hidden ? 1 : 0;
     event.label = window.label.c_str();
     event.label_len = window.label.size();
     event.title = window.title.c_str();
@@ -1185,6 +1294,24 @@ static std::string shortcutKeyFromWParam(WPARAM wparam) {
         case VK_RIGHT: return "arrowright";
         case VK_UP: return "arrowup";
         case VK_DOWN: return "arrowdown";
+        case VK_DELETE: return "delete";
+        case VK_HOME: return "home";
+        case VK_END: return "end";
+        case VK_PRIOR: return "pageup";
+        case VK_NEXT: return "pagedown";
+        case VK_INSERT: return "insert";
+        case VK_F1: return "f1";
+        case VK_F2: return "f2";
+        case VK_F3: return "f3";
+        case VK_F4: return "f4";
+        case VK_F5: return "f5";
+        case VK_F6: return "f6";
+        case VK_F7: return "f7";
+        case VK_F8: return "f8";
+        case VK_F9: return "f9";
+        case VK_F10: return "f10";
+        case VK_F11: return "f11";
+        case VK_F12: return "f12";
         case VK_OEM_PLUS: return "=";
         case VK_OEM_MINUS: return "-";
         case VK_OEM_COMMA: return ",";
@@ -1259,6 +1386,18 @@ static std::string shortcutKeyLabel(const std::string &key) {
     if (key == "arrowright") return "Right";
     if (key == "arrowup") return "Up";
     if (key == "arrowdown") return "Down";
+    if (key == "delete") return "Del";
+    if (key == "home") return "Home";
+    if (key == "end") return "End";
+    if (key == "pageup") return "PgUp";
+    if (key == "pagedown") return "PgDn";
+    if (key == "insert") return "Ins";
+    if (key.size() >= 2 && key.size() <= 3 && key[0] == 'f' &&
+        std::isdigit(static_cast<unsigned char>(key[1]))) {
+        std::string label = key;
+        label[0] = 'F';
+        return label;
+    }
     return key;
 }
 
@@ -1370,7 +1509,7 @@ static void showTrayMenu(Host *host, HWND hwnd) {
 }
 
 static bool emitShortcutForWindow(Host *host, const Window *window, WPARAM wparam) {
-    if (!host || host->shortcuts.empty()) return false;
+    if (!host || (host->shortcuts.empty() && host->menus.empty())) return false;
     if (!window) return false;
     std::string key = shortcutKeyFromWParam(wparam);
     if (key.empty()) return false;
@@ -1392,6 +1531,26 @@ static bool emitShortcutForWindow(Host *host, const Window *window, WPARAM wpara
             event.shortcut_modifiers = shortcut.modifiers;
             host->callback(host->callback_context, &event);
             return true;
+        }
+        /* Menu accelerators dispatch from the same keydown path: a menu
+         * item's key+modifiers is a keyboard binding whose event is the
+         * item's menu command, exactly as if the item were clicked. The
+         * other platforms get this from their menu systems (AppKit key
+         * equivalents, GTK accels); here the message loop is that system. */
+        for (const Menu &menu : host->menus) {
+            for (const MenuItem &item : menu.items) {
+                if (item.separator || !item.enabled || item.key.empty()) continue;
+                if (item.key != key) continue;
+                if (!shortcutModifiersMatch(item.modifiers, allow_implicit_shift)) continue;
+                if (!host->callback) return true;
+                WindowsEvent event = {};
+                event.kind = kMenuCommand;
+                event.window_id = window->id;
+                event.command_name = item.command.c_str();
+                event.command_name_len = item.command.size();
+                host->callback(host->callback_context, &event);
+                return true;
+            }
         }
     }
     return false;
@@ -1421,17 +1580,51 @@ static int webViewExtent(double value) {
     return value > 1 ? (int)(value + 0.5) : 1;
 }
 
+/* Explicit webview frames arrive from the runtime in LOGICAL points and
+ * scale to physical pixels at the window's DPI, exactly like native view
+ * frames. The auto-filling main webview is the one exception: its frame
+ * is copied straight from the physical client rect (the top-level
+ * WM_SIZE handler), so it passes through unscaled. */
+static double webViewFrameScale(const ChildWebView &webview) {
+    if (!webview.frame_explicit || !webview.hwnd) return 1.0;
+    return (double)dpiForWindow(webview.hwnd) / 96.0;
+}
+
 static bool validChildWebViewFrame(double x, double y, double width, double height) {
     return x >= 0 && y >= 0 && width > 0 && height > 0;
 }
 
-static int nativeViewCoord(double value) {
+static constexpr int nativeViewCoord(double value) {
     return value > 0 ? (int)(value + 0.5) : 0;
 }
 
-static int nativeViewExtent(double value) {
-    return value > 0 ? (int)(value + 0.5) : 0;
+/* Compile-time proof of the accumulate-then-round frame policy (see
+ * nativeViewPhysicalFrame): rounding each nesting level separately drifts
+ * from the round of the logical sum — parent x=10.4 plus child x=10.4 at
+ * scale 1.5 is round(15.6) + round(15.6) = 32, one pixel right of the
+ * true origin round(20.8 * 1.5) = 31 — and an independently rounded
+ * extent opens the same one-pixel seam against an edge derived from the
+ * accumulated logical coordinates: origin 10.2 with width 10.2 at scale
+ * 1.5 ends at round(15.3) + round(15.3) = 30, but the true right edge is
+ * round(20.4 * 1.5) = 31. */
+static_assert(nativeViewCoord(10.4 * 1.5) + nativeViewCoord(10.4 * 1.5) == 32 && nativeViewCoord((10.4 + 10.4) * 1.5) == 31,
+    "per-level rounding must drift so the accumulate-then-round policy is load-bearing");
+static_assert(nativeViewCoord(10.2 * 1.5) + nativeViewCoord(10.2 * 1.5) == 30 && nativeViewCoord((10.2 + 10.2) * 1.5) == 31,
+    "independently rounded extents must open seams that edge-derived extents close");
+
+/* A scaled window CONTENT extent rounded to whole physical pixels — the
+ * same round-once policy as native view frames (see
+ * nativeViewPhysicalFrame). Truncating instead would land fractional-DPI
+ * windows one physical pixel short of the request: logical 726 at 125%
+ * is 907.5 physical, which must become 908, not 907. Every conversion of
+ * a scaled content size to a physical extent goes through here so the
+ * standard-chrome and hidden-titlebar paths cannot drift apart. */
+static constexpr LONG physicalContentExtent(double value) {
+    return (LONG)(value + 0.5);
 }
+
+static_assert(physicalContentExtent(726 * 1.25) == 908 && (LONG)(726 * 1.25) == 907,
+    "truncation must land a pixel short of the round so the rounding is load-bearing");
 
 static bool validNativeViewFrame(double x, double y, double width, double height) {
     return x >= 0 && y >= 0 && width >= 0 && height >= 0;
@@ -1507,17 +1700,53 @@ static void applySegmentedControlText(HWND hwnd, const std::string &text) {
     TabCtrl_SetCurSel(hwnd, 0);
 }
 
-static POINT nativeViewAbsoluteOrigin(Host *host, const NativeView &view) {
-    POINT point = { nativeViewCoord(view.x), nativeViewCoord(view.y) };
-    if (!host || view.parent.empty()) return point;
+/* Scale for converting the runtime's LOGICAL view frames into physical
+ * client pixels: the owning top-level window's DPI over 96. A
+ * DPI-unaware process reports 96, so this is 1.0 there and view frames
+ * pass through unchanged. */
+static double nativeViewFrameScale(Host *host, const NativeView &view) {
+    if (!host) return 1.0;
+    auto window = host->windows.find(view.window_id);
+    if (window == host->windows.end() || !window->second.hwnd) return 1.0;
+    return (double)dpiForWindow(window->second.hwnd) / 96.0;
+}
+
+/* Absolute LOGICAL origin of a view: its own frame origin plus every
+ * ancestor's, summed before any scaling or rounding. */
+static void nativeViewLogicalOrigin(Host *host, const NativeView &view, double *logical_x, double *logical_y) {
+    *logical_x = view.x;
+    *logical_y = view.y;
+    if (!host || view.parent.empty()) return;
     auto parent = host->native_views.find(nativeViewKey(view.window_id, view.parent));
     while (parent != host->native_views.end()) {
-        point.x += nativeViewCoord(parent->second.x);
-        point.y += nativeViewCoord(parent->second.y);
+        *logical_x += parent->second.x;
+        *logical_y += parent->second.y;
         if (parent->second.parent.empty()) break;
         parent = host->native_views.find(nativeViewKey(parent->second.window_id, parent->second.parent));
     }
-    return point;
+}
+
+/* Physical frame policy: every physical EDGE is the once-rounded product
+ * of an ACCUMULATED logical coordinate and the window scale. Accumulating
+ * before rounding matters because the sum of per-level rounds drifts from
+ * the round of the sum at fractional scales (and at fractional logical
+ * coordinates even at scale 1.0) — see the static_asserts beside
+ * nativeViewCoord for the numeric proof. Width and height fall out as
+ * edge differences (right = round((logical_x + width) * scale)) rather
+ * than independently rounded extents, so frames that abut logically —
+ * a sibling starting where the previous one ends, a child flush against
+ * its parent's edge — land on the same physical pixel column with no
+ * one-pixel gap or overlap at any scale. */
+static RECT nativeViewPhysicalFrame(Host *host, const NativeView &view, double scale) {
+    double logical_x = 0;
+    double logical_y = 0;
+    nativeViewLogicalOrigin(host, view, &logical_x, &logical_y);
+    RECT frame = {};
+    frame.left = nativeViewCoord(logical_x * scale);
+    frame.top = nativeViewCoord(logical_y * scale);
+    frame.right = nativeViewCoord((logical_x + view.width) * scale);
+    frame.bottom = nativeViewCoord((logical_y + view.height) * scale);
+    return frame;
 }
 
 static void applyNativeViewText(NativeView &view, const std::string &text) {
@@ -1561,8 +1790,9 @@ static void applyNativeViewAccessibility(NativeView &view) {
 
 static void applyNativeViewFrame(Host *host, NativeView &view) {
     if (!view.hwnd) return;
-    POINT origin = nativeViewAbsoluteOrigin(host, view);
-    MoveWindow(view.hwnd, origin.x, origin.y, nativeViewExtent(view.width), nativeViewExtent(view.height), TRUE);
+    const double scale = nativeViewFrameScale(host, view);
+    RECT frame = nativeViewPhysicalFrame(host, view, scale);
+    MoveWindow(view.hwnd, frame.left, frame.top, frame.right - frame.left, frame.bottom - frame.top, TRUE);
 }
 
 static void applyNativeViewState(NativeView &view, bool update_text, const std::string &text) {
@@ -1718,11 +1948,15 @@ constexpr uint64_t kGpuFrameIntervalNs = 16666667ull;
  * riding the frame channel (on_frame interpolation, armed tweens) and
  * snap it on restore; the heartbeat keeps those models gently current
  * while event-driven truth (audio position, input) flows at its own
- * cadence. Minimize (IsIconic on the root window) is the one occlusion
- * signal Win32 reports reliably for this GDI-presenting host; a window
- * fully covered by other windows has no dependable signal without a
- * DXGI presentation path, so covered-but-not-minimized windows keep
- * full cadence deliberately rather than guess. */
+ * cadence. Two occlusion facts key the throttle: minimize (IsIconic on
+ * the root window — the one signal Win32 reports reliably for this
+ * GDI-presenting host) and the close_policy .hide hide (host-owned
+ * bookkeeping: a policy-hidden window is SW_HIDE'd off the glass, and
+ * the menu-bar app shape keeps it that way for days — full-rate frame
+ * completions there are pure background CPU burn). A window fully
+ * covered by OTHER windows has no dependable signal without a DXGI
+ * presentation path, so covered-but-not-minimized windows keep full
+ * cadence deliberately rather than guess. */
 constexpr uint64_t kGpuOccludedHeartbeatNs = 1000000000ull;
 /* Placeholder pump timer (repeating, retired by the first present). */
 constexpr UINT_PTR kGpuFrameTimerId = 1;
@@ -1740,20 +1974,12 @@ static uint64_t gpuTimestampNs() {
     return seconds * 1000000000ull + remainder * 1000000000ull / (uint64_t)frequency.QuadPart;
 }
 
-/* Device scale for a gpu_surface child. GetDpiForWindow is resolved
- * dynamically so the host keeps working on Windows versions (and Wine
- * prefixes) that predate per-monitor DPI. In a DPI-unaware process the
- * call reports 96, so logical size == client pixels, matching how the
- * rest of this host treats coordinates. */
+/* Device scale for a gpu_surface child: the shared per-window DPI
+ * resolution (dpiForWindow) over the 96-dpi baseline. In a DPI-unaware
+ * process the resolved DPI is 96, so logical size == client pixels,
+ * matching how the rest of this host treats coordinates. */
 static double gpuSurfaceScale(HWND hwnd) {
-    using GetDpiForWindowFn = UINT(WINAPI *)(HWND);
-    static GetDpiForWindowFn get_dpi = reinterpret_cast<GetDpiForWindowFn>(
-        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow")));
-    if (get_dpi && hwnd) {
-        const UINT dpi = get_dpi(hwnd);
-        if (dpi > 0) return (double)dpi / 96.0;
-    }
-    return 1.0;
+    return hwnd ? (double)dpiForWindow(hwnd) / 96.0 : 1.0;
 }
 
 static NativeView *gpuSurfaceViewForHwnd(Host *host, HWND hwnd) {
@@ -1762,6 +1988,63 @@ static NativeView *gpuSurfaceViewForHwnd(Host *host, HWND hwnd) {
         if (entry.second.hwnd == hwnd && entry.second.kind == kViewGpuSurface) return &entry.second;
     }
     return nullptr;
+}
+
+/* Present the pending app context menu — the tray menu's popup
+ * discipline (SetForegroundWindow, TPM_RETURNCMD | TPM_NONOTIFY, the
+ * WM_NULL post) applied to the runtime's declared items. Runs from the
+ * kShowContextMenuMessage case in the window procedure, so it is on the
+ * message-loop thread but on a FRESH loop turn, never nested inside the
+ * input dispatch that requested it. TrackPopupMenu blocks in its own
+ * modal message loop until the user picks or dismisses (the same shape
+ * as the macOS host's popUpMenuPositioningItem nested tracking loop),
+ * and TPM_RETURNCMD hands the selection back inline — the
+ * kContextMenuAction event is emitted right after it returns, selection
+ * or dismissal (menu_item_id 0) alike, exactly the payload the macOS
+ * host emits so replay is shape-identical across platforms. */
+static void showAppContextMenu(Host *host, HWND hwnd) {
+    if (!host || !host->context_menu.active) return;
+    PendingContextMenu request = std::move(host->context_menu);
+    host->context_menu = PendingContextMenu{};
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    for (const PendingContextMenu::Item &item : request.items) {
+        if (item.separator) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            continue;
+        }
+        UINT flags = MF_STRING;
+        if (!item.enabled) flags |= MF_GRAYED;
+        std::wstring label = widen(item.label);
+        AppendMenuW(menu, flags, item.id, label.c_str());
+    }
+    /* The request's point is LOGICAL view-local (the exact coordinates
+     * the gpu-surface input path reported the click in, which divides
+     * physical client pixels by gpuSurfaceScale on the way out): invert
+     * that scale against the presenting view's HWND — the gpu-surface
+     * child when the label resolves, the top-level client area otherwise
+     * — then map to screen for TrackPopupMenu. */
+    HWND target = hwnd;
+    if (!request.view_label.empty()) {
+        auto view = host->native_views.find(nativeViewKey(request.window_id, request.view_label));
+        if (view != host->native_views.end() && view->second.hwnd) target = view->second.hwnd;
+    }
+    const double scale = gpuSurfaceScale(target);
+    POINT point = { (LONG)lround(request.x * scale), (LONG)lround(request.y * scale) };
+    ClientToScreen(target, &point);
+    SetForegroundWindow(hwnd);
+    UINT command_id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+    WindowsEvent event = {};
+    event.kind = kContextMenuAction;
+    event.window_id = request.window_id;
+    event.view_label = request.view_label.c_str();
+    event.view_label_len = request.view_label.size();
+    event.timestamp_ns = gpuTimestampNs();
+    event.widget_id = request.token;
+    event.menu_item_id = command_id;
+    if (host->callback) host->callback(host->callback_context, &event);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
 }
 
 /* ------------------------------------------------------------------------
@@ -1846,8 +2129,17 @@ static Window *chromelessWindowForHwnd(Host *host, HWND hwnd) {
     return nullptr;
 }
 
-/* Per-window dpi with the same dynamic resolution (and the same 96
- * fallback) as gpuSurfaceScale. */
+static UINT systemDpi();
+
+/* Per-window DPI, resolved dynamically to mirror the awareness chain
+ * the embedded manifest declares. GetDpiForWindow (Windows 10 1607+,
+ * per-monitor v2 — modern Wine prefixes export it too) is preferred;
+ * where it is absent, shcore's GetDpiForMonitor reports the effective
+ * DPI of the window's monitor (Windows 8.1+, matching per-monitor v1
+ * awareness); where shcore is absent too, the system DPI (matching
+ * system-DPI awareness; older Wine prefixes land here through
+ * systemDpi's GetDeviceCaps branch). A DPI-unaware process reports 96
+ * on every branch, so logical points == client pixels there. */
 static UINT dpiForWindow(HWND hwnd) {
     using GetDpiForWindowFn = UINT(WINAPI *)(HWND);
     static GetDpiForWindowFn get_dpi = reinterpret_cast<GetDpiForWindowFn>(
@@ -1856,7 +2148,22 @@ static UINT dpiForWindow(HWND hwnd) {
         const UINT dpi = get_dpi(hwnd);
         if (dpi > 0) return dpi;
     }
-    return 96;
+    using GetDpiForMonitorFn = HRESULT(WINAPI *)(HMONITOR, int, UINT *, UINT *);
+    static GetDpiForMonitorFn get_monitor_dpi = []() -> GetDpiForMonitorFn {
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        if (!shcore) return nullptr;
+        return reinterpret_cast<GetDpiForMonitorFn>(
+            reinterpret_cast<void *>(GetProcAddress(shcore, "GetDpiForMonitor")));
+    }();
+    if (get_monitor_dpi && hwnd) {
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        UINT dpi_x = 0;
+        UINT dpi_y = 0;
+        /* 0 = MDT_EFFECTIVE_DPI, spelled numerically so headers that
+         * predate shellscalingapi.h still compile. */
+        if (monitor && get_monitor_dpi(monitor, 0, &dpi_x, &dpi_y) == S_OK && dpi_y > 0) return dpi_y;
+    }
+    return systemDpi();
 }
 
 /* Caption metrics MUST scale with the monitor the window sits on, or a
@@ -1869,6 +2176,43 @@ static int systemMetricForDpi(int index, UINT dpi) {
         reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi")));
     if (get_metric) return get_metric(index, dpi);
     return GetSystemMetrics(index);
+}
+
+/* System DPI for sizing a window that does not exist yet (creation
+ * scales the requested logical content size to physical pixels before
+ * the first monitor is known; WM_DPICHANGED re-derives the frame when
+ * the window lands elsewhere), and the tail of dpiForWindow's chain
+ * where no per-monitor API is available. GetDpiForSystem is resolved
+ * dynamically (Windows 10 1607+) with the desktop DC's LOGPIXELSY,
+ * then 96, as fallbacks. A DPI-unaware process reports 96 on every
+ * branch, keeping points == pixels exactly as before. */
+static UINT systemDpi() {
+    using GetDpiForSystemFn = UINT(WINAPI *)();
+    static GetDpiForSystemFn get_dpi = reinterpret_cast<GetDpiForSystemFn>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForSystem")));
+    if (get_dpi) {
+        const UINT dpi = get_dpi();
+        if (dpi > 0) return dpi;
+    }
+    HDC dc = GetDC(nullptr);
+    if (dc) {
+        const int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+        ReleaseDC(nullptr, dc);
+        if (dpi > 0) return (UINT)dpi;
+    }
+    return 96;
+}
+
+/* AdjustWindowRectEx pinned to an explicit DPI so the frame borders
+ * match the monitor the window is being sized against; resolved
+ * dynamically (Windows 10 1607+) with the classic system-metric call
+ * as the fallback. */
+static BOOL adjustWindowRectForDpi(RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi) {
+    using AdjustWindowRectExForDpiFn = BOOL(WINAPI *)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    static AdjustWindowRectExForDpiFn adjust = reinterpret_cast<AdjustWindowRectExForDpiFn>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi")));
+    if (adjust) return adjust(rect, style, menu, ex_style, dpi);
+    return AdjustWindowRectEx(rect, style, menu, ex_style);
 }
 
 /* Thickness of the top resize frame (sizing border + padded border) at
@@ -1943,12 +2287,12 @@ static void applyHiddenTitlebarFrame(Window &window) {
  * bottom borders, plus the menu bar when one is attached. Plain
  * AdjustWindowRectEx would count the caption band the custom calc gives
  * back, landing the client one band taller than requested. */
-static SIZE hiddenOuterSizeForContent(DWORD style, DWORD ex_style, bool has_menu, double content_width, double content_height) {
+static SIZE hiddenOuterSizeForContent(DWORD style, DWORD ex_style, bool has_menu, double content_width, double content_height, UINT dpi) {
     RECT borders = { 0, 0, 0, 0 };
-    AdjustWindowRectEx(&borders, style & ~WS_CAPTION, FALSE, ex_style);
+    adjustWindowRectForDpi(&borders, style & ~WS_CAPTION, FALSE, ex_style, dpi);
     SIZE outer = {};
-    outer.cx = (LONG)content_width + (borders.right - borders.left);
-    outer.cy = (LONG)content_height + borders.bottom + (has_menu ? GetSystemMetrics(SM_CYMENU) : 0);
+    outer.cx = physicalContentExtent(content_width) + (borders.right - borders.left);
+    outer.cy = physicalContentExtent(content_height) + borders.bottom + (has_menu ? systemMetricForDpi(SM_CYMENU, dpi) : 0);
     return outer;
 }
 
@@ -2246,13 +2590,19 @@ static void gpuSurfaceAdvancePacingClock(NativeView &view) {
     }
 }
 
-/* Frame completions run on the minimized heartbeat when the surface has
- * presented at least once and its top-level window is iconic — the same
- * first-present exemption the macOS occluded pacing keeps, so surface
- * establishment (and the nonblank verdict automation reads) is never
- * throttled. */
-static bool gpuSurfaceOccludedPacingActive(const NativeView &view) {
+/* Frame completions run on the occluded heartbeat when the surface has
+ * presented at least once and its window is off the glass — iconic, or
+ * alive-but-hidden under close_policy .hide (see kGpuOccludedHeartbeatNs:
+ * both facts are reliable, and a policy-hidden menu-bar app would
+ * otherwise spin its frame loop full-rate for days). First-present
+ * exemption as on macOS, so surface establishment (and the nonblank
+ * verdict automation reads) is never throttled. */
+static bool gpuSurfaceOccludedPacingActive(Host *host, const NativeView &view) {
     if (!view.gpu_presented || !view.hwnd) return false;
+    if (host) {
+        auto owner = host->windows.find(view.window_id);
+        if (owner != host->windows.end() && owner->second.policy_hidden) return true;
+    }
     HWND root = GetAncestor(view.hwnd, GA_ROOT);
     return root != nullptr && IsIconic(root);
 }
@@ -2286,7 +2636,7 @@ static void gpuSurfaceEmitFrame(Host *host, NativeView &view, HWND hwnd) {
     /* Heartbeat-paced completions are not latency endpoints: their
      * timestamp measures the deliberate minimized cadence, not a paint
      * — the runtime skips input-latency stamping for them. */
-    event.occluded = gpuSurfaceOccludedPacingActive(view) ? 1 : 0;
+    event.occluded = gpuSurfaceOccludedPacingActive(host, view) ? 1 : 0;
     emitGpuSurfaceEvent(host, view, event);
 }
 
@@ -2297,16 +2647,17 @@ static void gpuSurfaceEmitFrame(Host *host, NativeView &view, HWND hwnd) {
  * re-enter the engine — and the pacing clock's grid stamping keeps the
  * message hop out of the period. SetTimer clamps short delays up to its
  * ~10 ms floor; the clock absorbs that as jitter, not drift. */
-static void gpuSurfaceScheduleFrameEmission(NativeView &view) {
+static void gpuSurfaceScheduleFrameEmission(Host *host, NativeView &view) {
     if (!view.hwnd || view.gpu_emission_scheduled) return;
     const uint64_t now = gpuTimestampNs();
-    /* Minimized surfaces pace on the heartbeat, not the frame grid —
-     * see kGpuOccludedHeartbeatNs. Exempt: an input's responding frame
-     * (external truth on its own cadence; it cannot sustain a spin).
-     * Restore re-arms the pending timer at the grid delay (the
-     * top-level WM_SIZE handler), so the long delay never gates the
-     * return to full cadence. */
-    const uint64_t pace_ns = (!view.gpu_prompt_frame_pending && gpuSurfaceOccludedPacingActive(view)) ? kGpuOccludedHeartbeatNs : kGpuFrameIntervalNs;
+    /* Occluded surfaces (minimized or policy-hidden) pace on the
+     * heartbeat, not the frame grid — see kGpuOccludedHeartbeatNs.
+     * Exempt: an input's responding frame (external truth on its own
+     * cadence; it cannot sustain a spin). Reveal re-arms the pending
+     * timer at the grid delay (restore through the top-level WM_SIZE
+     * handler, re-show through the show verb), so the long delay never
+     * gates the return to full cadence. */
+    const uint64_t pace_ns = (!view.gpu_prompt_frame_pending && gpuSurfaceOccludedPacingActive(host, view)) ? kGpuOccludedHeartbeatNs : kGpuFrameIntervalNs;
     uint64_t delay_ns = 0;
     if (view.gpu_last_emit_ns > 0 && now < view.gpu_last_emit_ns + pace_ns) {
         delay_ns = view.gpu_last_emit_ns + pace_ns - now;
@@ -2363,6 +2714,13 @@ static std::string gpuSurfaceKeyName(WPARAM wparam) {
 }
 
 static void gpuSurfaceCharInput(Host *host, NativeView &view, WPARAM wparam) {
+    /* A keystroke a registered shortcut consumed never ALSO types: the
+     * message loop translated its WM_CHAR(s) before the accelerator
+     * could refuse them. The latch holds for the WHOLE translated burst
+     * — one keystroke can post several UTF-16 units (ligature layouts,
+     * surrogate pairs) — and is bounded by the message sequence, not a
+     * count: the next WM_KEYDOWN or WM_KEYUP disarms it. */
+    if (view.gpu_shortcut_ate_char) return;
     const WCHAR unit = (WCHAR)wparam;
     std::wstring wide;
     if (unit >= 0xD800 && unit <= 0xDBFF) {
@@ -2380,8 +2738,15 @@ static void gpuSurfaceCharInput(Host *host, NativeView &view, WPARAM wparam) {
         wide.push_back(unit);
     }
     /* Control/alt chords produce control characters or menu accelerators,
-     * not text; mirror the GTK path, which skips text for modified keys. */
-    if (keyDown(VK_CONTROL) || keyDown(VK_MENU) || keyDown(VK_LWIN) || keyDown(VK_RWIN)) return;
+     * not text; mirror the GTK path, which skips text for modified keys.
+     * EXCEPT AltGr: Windows raises Ctrl+Alt together for it, and an
+     * AltGr-composed printable (AltGr+Q -> "@" on German layouts) IS
+     * committed text — the one chord whose WM_CHAR must flow, or those
+     * layouts lose the character entirely (an AltGr chord a shortcut
+     * consumed was already discarded above). Win alone still gates. */
+    const bool altgr = keyDown(VK_CONTROL) && keyDown(VK_MENU);
+    if (!altgr && (keyDown(VK_CONTROL) || keyDown(VK_MENU))) return;
+    if (keyDown(VK_LWIN) || keyDown(VK_RWIN)) return;
     const std::string text = narrow(wide);
     if (text.empty()) return;
     emitGpuSurfaceInput(host, view, kGpuInputTextInput, view.gpu_pointer_x, view.gpu_pointer_y, 0, 0, 0, "", text.c_str(), gpuModifierFlags());
@@ -2402,7 +2767,7 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
                     KillTimer(hwnd, kGpuFrameTimerId);
                     return 0;
                 }
-                gpuSurfaceScheduleFrameEmission(*view);
+                gpuSurfaceScheduleFrameEmission(host, *view);
                 return 0;
             }
             if (wparam == kGpuEmitTimerId) {
@@ -2491,12 +2856,64 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
             return 0;
         }
         case WM_MOUSEMOVE: {
+            /* Win32 only reports the pointer LEAVING the client area on
+             * request: arm TME_LEAVE once per hover session so the
+             * WM_MOUSELEAVE below can retire hover state (washes, hover
+             * Msgs, tooltip intent) the way the AppKit host's
+             * mouseExited does. */
+            if (!view->gpu_mouse_tracking) {
+                TRACKMOUSEEVENT track = {};
+                track.cbSize = sizeof(track);
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hwnd;
+                if (TrackMouseEvent(&track)) view->gpu_mouse_tracking = 1;
+            }
             const double x = (double)(short)LOWORD(lparam) / scale;
             const double y = (double)(short)HIWORD(lparam) / scale;
             view->gpu_pointer_x = x;
             view->gpu_pointer_y = y;
             const int kind = view->gpu_pointer_down ? kGpuInputPointerDrag : kGpuInputPointerMove;
             emitGpuSurfaceInput(host, *view, kind, x, y, 0, 0, 0, "", "", gpuModifierFlags());
+            return 0;
+        }
+        case WM_MOUSELEAVE: {
+            view->gpu_mouse_tracking = 0;
+            /* The pointer left the client area without a press in
+             * flight: the window-leave edge, reported as the same
+             * pointer cancel a capture loss emits. A captured drag
+             * keeps receiving moves outside the window and settles
+             * through its own up/capture-change instead. One
+             * exception: in-canvas window-drag regions answer
+             * WM_NCHITTEST with HTTRANSPARENT (the parent drags), so
+             * the OS reports a "leave" the moment the cursor enters
+             * one while it still sits over this canvas. That hand-off
+             * is recognized by BOTH tests below - the cursor is still
+             * geometrically inside our rectangle AND the window now
+             * owning the point is one of our own ancestors (hit-test
+             * transparency forwards to the parent chain). A cursor
+             * inside our rectangle but owned by a SIBLING child (an
+             * overlapping WebView pane) is a genuine departure and
+             * must cancel, or hover strands until a later move. */
+            if (!view->gpu_pointer_down) {
+                POINT screen = {};
+                bool suppressed = false;
+                if (GetCursorPos(&screen)) {
+                    POINT client = screen;
+                    RECT rect = {};
+                    if (ScreenToClient(hwnd, &client) && GetClientRect(hwnd, &rect) && PtInRect(&rect, client)) {
+                        const HWND owner = WindowFromPoint(screen);
+                        for (HWND walk = GetParent(hwnd); walk; walk = GetParent(walk)) {
+                            if (walk == owner) {
+                                suppressed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!suppressed) {
+                    emitGpuSurfaceInput(host, *view, kGpuInputPointerCancel, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, "", "", gpuModifierFlags());
+                }
+            }
             return 0;
         }
         case WM_CAPTURECHANGED:
@@ -2525,7 +2942,18 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
         }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
-            if (emitShortcutForHwnd(host, GetAncestor(hwnd, GA_ROOT), wparam)) return 0;
+            /* A fresh keystroke re-disarms the one-shot: a shortcut that
+             * translated to no WM_CHAR (F-keys) must not leave it armed
+             * to eat a later ordinary character. */
+            view->gpu_shortcut_ate_char = false;
+            if (emitShortcutForHwnd(host, GetAncestor(hwnd, GA_ROOT), wparam)) {
+                /* The keystroke was consumed as a shortcut; its
+                 * already-translated WM_CHAR (posted by the message
+                 * loop's TranslateMessage before this dispatch) must
+                 * not ALSO type — one keystroke, one action. */
+                view->gpu_shortcut_ate_char = true;
+                return 0;
+            }
             const std::string key = gpuSurfaceKeyName(wparam);
             if (!key.empty()) {
                 emitGpuSurfaceInput(host, *view, kGpuInputKeyDown, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, key.c_str(), "", gpuModifierFlags());
@@ -2534,6 +2962,9 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
         }
         case WM_KEYUP:
         case WM_SYSKEYUP: {
+            /* The shortcut keystroke's translated burst ended with its
+             * release: disarm the char latch (see gpuSurfaceCharInput). */
+            view->gpu_shortcut_ate_char = false;
             const std::string key = gpuSurfaceKeyName(wparam);
             if (!key.empty()) {
                 emitGpuSurfaceInput(host, *view, kGpuInputKeyUp, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, key.c_str(), "", gpuModifierFlags());
@@ -3412,16 +3843,19 @@ static void audioSpectrumStartCapture(Host *host) {
 }
 
 /* Whether any of the host's top-level windows still reaches the glass.
- * Minimize-keyed on purpose: IsIconic is the one occlusion fact this
- * host trusts (the same decision the minimized frame heartbeat makes —
- * the covered-but-not-minimized case has no reliable cheap signal on
- * the DXGI presentation path), so covered windows keep full spectrum
- * cadence and only an all-minimized app goes quiet. Checked across the
- * whole window table because a spectrum consumer may draw its bands in
- * any of the app's windows. */
+ * Keyed on the two occlusion facts this host trusts (the same decision
+ * the occluded frame heartbeat makes): minimize (IsIconic) and the
+ * close_policy .hide hide (policy_hidden — a menu-bar app's window off
+ * the glass behind its tray icon must not keep 25 Hz spectrum
+ * emissions flowing for a display nobody can see). The
+ * covered-but-not-minimized case has no reliable cheap signal without
+ * a DXGI presentation path, so covered windows keep full spectrum
+ * cadence and only an app with every window minimized or policy-hidden
+ * goes quiet. Checked across the whole window table because a spectrum
+ * consumer may draw its bands in any of the app's windows. */
 static bool audioAnyWindowReachesGlass(Host *host) {
     for (auto &entry : host->windows) {
-        if (entry.second.hwnd && !IsIconic(entry.second.hwnd)) return true;
+        if (entry.second.hwnd && !IsIconic(entry.second.hwnd) && !entry.second.policy_hidden) return true;
     }
     return false;
 }
@@ -3432,12 +3866,13 @@ static bool audioAnyWindowReachesGlass(Host *host) {
  * transports emit nothing — the bars freeze honestly — while silence on
  * a rolling transport still emits its row of zeros. The occluded-
  * emission rule gates delivery too: SPECTRUM bands describe a display,
- * so while every window is minimized no report is emitted — no event
- * wakes the runtime's update loop for glass nobody can see, and the
- * journal records the stretch as honest silence. The capture thread
- * keeps its ring fresh (it must drain the loopback client regardless,
- * and its FFT runs off the loop thread), so the first beat after a
- * restore delivers current bands — honest within one report. */
+ * so while every window is minimized or policy-hidden no report is
+ * emitted — no event wakes the runtime's update loop for glass nobody
+ * can see, and the journal records the stretch as honest silence. The
+ * capture thread keeps its ring fresh (it must drain the loopback
+ * client regardless, and its FFT runs off the loop thread), so the
+ * first beat after a restore or re-show delivers current bands —
+ * honest within one report. */
 static void audioHandleSpectrumMessage(Host *host, WPARAM generation) {
     AudioState &audio = host->audio;
     AudioSpectrumState &spectrum = host->spectrum;
@@ -3821,6 +4256,96 @@ static void destroyAllWindows(Host *host) {
 #if NATIVE_SDK_HAS_WEBVIEW2
 using CreateEnvironmentFn = HRESULT (STDAPICALLTYPE *)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
 
+/* The event-handler factory. The full WRL provides this as
+ * Microsoft::WRL::Callback, but the mingw WRL subset only carries ComPtr,
+ * so the handful of WebView2 completion and event handlers are built on
+ * this minimal equivalent: one refcounted COM object per handler that
+ * forwards Invoke to the wrapped callable. QueryInterface needs each
+ * handler's IID at runtime; the constants mirror the interface
+ * declarations in WebView2.h (mingw's __uuidof only covers interfaces
+ * its own headers declare, the same reason the WIC GUIDs further down
+ * are defined locally). */
+static const GUID kNativeSdkIID_EnvironmentCompletedHandler = {0x4e8a3389, 0xc9d8, 0x4bd2, {0xb6, 0xb5, 0x12, 0x4f, 0xee, 0x6c, 0xc1, 0x4d}};
+static const GUID kNativeSdkIID_ControllerCompletedHandler = {0x6c4819f3, 0xc9b7, 0x4260, {0x81, 0x27, 0xc9, 0xf5, 0xbd, 0xe7, 0xf6, 0x8c}};
+static const GUID kNativeSdkIID_WebMessageReceivedHandler = {0x57213f19, 0x00e6, 0x49fa, {0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2}};
+static const GUID kNativeSdkIID_AcceleratorKeyPressedHandler = {0xb29c7e28, 0xfa79, 0x41a8, {0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2}};
+static const GUID kNativeSdkIID_FocusChangedHandler = {0x05ea24bd, 0x6452, 0x4926, {0x90, 0x14, 0x4b, 0x82, 0xb4, 0x98, 0x13, 0x5d}};
+static const GUID kNativeSdkIID_WebResourceRequestedHandler = {0xab00b74c, 0x15f1, 0x4646, {0x80, 0xe8, 0xe7, 0x63, 0x41, 0xd2, 0x5d, 0x71}};
+static const GUID kNativeSdkIID_NavigationStartingHandler = {0x9adbe429, 0xf36d, 0x432b, {0x9d, 0xdc, 0xf8, 0x88, 0x1f, 0xbd, 0x76, 0xe3}};
+
+template <typename Interface> struct WebView2HandlerIid;
+template <> struct WebView2HandlerIid<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler> {
+    static const GUID &value() { return kNativeSdkIID_EnvironmentCompletedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> {
+    static const GUID &value() { return kNativeSdkIID_ControllerCompletedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2WebMessageReceivedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_WebMessageReceivedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2AcceleratorKeyPressedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_AcceleratorKeyPressedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2FocusChangedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_FocusChangedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2WebResourceRequestedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_WebResourceRequestedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2NavigationStartingEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_NavigationStartingHandler; }
+};
+
+/* Every handler interface above declares a two-argument Invoke; this
+ * trait reads the argument types off the interface so the override below
+ * matches exactly. */
+template <typename Method> struct WebView2InvokeSignature;
+template <typename Interface, typename FirstArg, typename SecondArg>
+struct WebView2InvokeSignature<HRESULT (STDMETHODCALLTYPE Interface::*)(FirstArg, SecondArg)> {
+    using First = FirstArg;
+    using Second = SecondArg;
+};
+
+template <typename Interface, typename Callable>
+class WebView2Handler final : public Interface {
+public:
+    explicit WebView2Handler(Callable callable) : callable_(std::move(callable)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
+        if (!object) return E_POINTER;
+        if (IsEqualIID(riid, WebView2HandlerIid<Interface>::value()) || IsEqualIID(riid, IID_IUnknown)) {
+            *object = static_cast<Interface *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return refs_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG remaining = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (remaining == 0) delete this;
+        return remaining;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(
+        typename WebView2InvokeSignature<decltype(&Interface::Invoke)>::First first,
+        typename WebView2InvokeSignature<decltype(&Interface::Invoke)>::Second second) override {
+        return callable_(first, second);
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    Callable callable_;
+};
+
+template <typename Interface, typename Callable>
+static ComPtr<Interface> Callback(Callable callable) {
+    ComPtr<Interface> handler;
+    handler.Attach(new WebView2Handler<Interface, Callable>(std::move(callable)));
+    return handler;
+}
+
 static const wchar_t *nativeSdkBridgeScript() {
     return LR"ZN((function(){
 	if(window.zero&&window.zero.invoke&&window.zero.on&&window.zero._emit){return;}
@@ -3942,17 +4467,19 @@ static const wchar_t *nativeSdkBridgeScript() {
 }
 
 static RECT webViewRect(const ChildWebView &webview) {
+    const double scale = webViewFrameScale(webview);
     RECT rect = {};
     rect.left = 0;
     rect.top = 0;
-    rect.right = webViewExtent(webview.width);
-    rect.bottom = webViewExtent(webview.height);
+    rect.right = webViewExtent(webview.width * scale);
+    rect.bottom = webViewExtent(webview.height * scale);
     return rect;
 }
 
 static void applyWebViewFrame(ChildWebView &webview) {
     if (!webview.hwnd) return;
-    MoveWindow(webview.hwnd, webViewCoord(webview.x), webViewCoord(webview.y), webViewExtent(webview.width), webViewExtent(webview.height), TRUE);
+    const double scale = webViewFrameScale(webview);
+    MoveWindow(webview.hwnd, webViewCoord(webview.x * scale), webViewCoord(webview.y * scale), webViewExtent(webview.width * scale), webViewExtent(webview.height * scale), TRUE);
     if (webview.controller) {
         RECT bounds = webViewRect(webview);
         webview.controller->put_Bounds(bounds);
@@ -4100,6 +4627,23 @@ static bool createChildWebView(Host *host, const std::string &key) {
                     controller->put_Bounds(bounds);
                     controller->put_ZoomFactor(found->second.zoom);
                     controller->put_IsVisible(TRUE);
+                    EventRegistrationToken focus_token = {};
+                    controller->add_GotFocus(Callback<ICoreWebView2FocusChangedEventHandler>(
+                        [host, key, lifetime](ICoreWebView2Controller *, IUnknown *) -> HRESULT {
+                            auto token = lifetime.lock();
+                            if (!token) return S_OK;
+                            std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                            if (!token->alive || !host->callback) return S_OK;
+                            auto focused = host->webviews.find(key);
+                            if (focused == host->webviews.end()) return S_OK;
+                            WindowsEvent event = {};
+                            event.kind = kViewFocused;
+                            event.window_id = focused->second.window_id;
+                            event.view_label = focused->second.label.c_str();
+                            event.view_label_len = focused->second.label.size();
+                            host->callback(host->callback_context, &event);
+                            return S_OK;
+                        }).Get(), &focus_token);
                     if (found->second.webview) {
                         if (found->second.bridge_enabled) {
                             found->second.webview->AddScriptToExecuteOnDocumentCreated(nativeSdkBridgeScript(), nullptr);
@@ -4107,7 +4651,7 @@ static bool createChildWebView(Host *host, const std::string &key) {
                             uint64_t bridge_window_id = found->second.window_id;
                             std::string bridge_label = found->second.label;
                             found->second.webview->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                [host, bridge_window_id, bridge_label, lifetime](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
+                                [host, key, bridge_window_id, bridge_label, lifetime](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
                                     auto token = lifetime.lock();
                                     if (!token) return S_OK;
                                     std::lock_guard<std::recursive_mutex> guard(token->mutex);
@@ -4249,6 +4793,23 @@ static bool windowsAppsUseDarkTheme() {
     return dark;
 }
 
+/* Standard-chrome titlebars follow the OS app color scheme: the
+ * immersive-dark attribute flips the DWM caption to its dark palette,
+ * so an app rendering the dark theme (apps follow the OS scheme through
+ * the appearance channel by default) does not sit under a glaring white
+ * titlebar. Hidden-titlebar windows own their caption fidelity already
+ * (syncHiddenCaptionColor samples the presented header pixels — a
+ * strictly better signal), and chromeless windows have no caption at
+ * all, so both stay out of this. Older builds reject the attribute and
+ * keep the system default. */
+static void applyStandardTitlebarColorScheme(Window &window) {
+    if (!window.hwnd || windowUsesHiddenTitlebar(window) || windowIsChromeless(window)) return;
+    const DwmApi &dwm = dwmApi();
+    if (!dwm.set_window_attribute) return;
+    const BOOL dark = windowsAppsUseDarkTheme() ? TRUE : FALSE;
+    dwm.set_window_attribute(window.hwnd, kDwmwaUseImmersiveDarkMode, &dark, sizeof(dark));
+}
+
 /* Appearance from OS settings: the apps dark preference, disabled
  * client-area animations as the reduce-motion signal, and the high
  * contrast accessibility flag. Emitted once after START and again
@@ -4269,6 +4830,10 @@ static void emitAppearanceIfChanged(Host *host, bool force) {
     host->appearance_color_scheme = dark;
     host->appearance_reduce_motion = reduce_motion;
     host->appearance_high_contrast = high_contrast;
+    /* Standard-chrome captions track the scheme live: flipping the OS
+     * theme flips the titlebar with the appearance event the app
+     * re-themes from. */
+    for (auto &entry : host->windows) applyStandardTitlebarColorScheme(entry.second);
     WindowsEvent event = {};
     event.kind = kAppearance;
     event.color_scheme = dark;
@@ -4445,6 +5010,9 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
         case kAudioSpectrumMessage:
             if (host) audioHandleSpectrumMessage(host, wparam);
             return 0;
+        case kShowContextMenuMessage:
+            if (host) showAppContextMenu(host, hwnd);
+            return 0;
         case kNotificationCallbackMessage:
             if (host && host->tray_active) {
                 UINT tray_event = LOWORD(lparam);
@@ -4531,13 +5099,25 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                         if (surface.kind != kViewGpuSurface || !surface.hwnd || !surface.gpu_emission_scheduled) continue;
                         if (GetAncestor(surface.hwnd, GA_ROOT) != hwnd) continue;
                         surface.gpu_emission_scheduled = false;
-                        gpuSurfaceScheduleFrameEmission(surface);
+                        gpuSurfaceScheduleFrameEmission(host, surface);
                     }
                 }
             }
             return 0;
         case WM_SETFOCUS:
         case WM_KILLFOCUS:
+            if (host) {
+                /* Native child views own Win32 focus directly. Project
+                 * their focus edges onto the owning top-level window so
+                 * runtime key-window state follows child-to-child and
+                 * cross-window focus moves, not only the rare edges
+                 * delivered to the top-level HWND itself. */
+                HWND root = GetAncestor(hwnd, GA_ROOT);
+                for (auto &entry : host->windows) {
+                    if (entry.second.hwnd == root) emit(host, entry.second, kWindowFrame);
+                }
+            }
+            return 0;
         case WM_MOVE:
             if (host) {
                 for (auto &entry : host->windows) {
@@ -4545,6 +5125,56 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 }
             }
             return 0;
+        case WM_DPICHANGED:
+            /* The window moved to a monitor with a different DPI (or the
+             * user changed display scaling). Adopt the system-suggested
+             * frame — it keeps the window the same LOGICAL size on the
+             * new scale — then re-derive everything DPI-dependent: the
+             * hidden-titlebar band (its caption metrics scale with the
+             * monitor), each native child's physical frame, every gpu
+             * surface's logical-size/scale pairing so the runtime
+             * re-rasterizes at the new density, and each explicit child
+             * webview's physical frame. The SetWindowPos WM_SIZE
+             * re-emits kResize, which now carries the new scale. Only
+             * per-monitor-DPI-aware processes receive this message. */
+            if (host) {
+                const RECT *suggested = reinterpret_cast<const RECT *>(lparam);
+                if (suggested) {
+                    SetWindowPos(hwnd, nullptr, suggested->left, suggested->top, suggested->right - suggested->left, suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                for (auto &entry : host->windows) {
+                    if (entry.second.hwnd == hwnd && windowUsesHiddenTitlebar(entry.second)) applyHiddenTitlebarFrame(entry.second);
+                }
+                for (auto &view_entry : host->native_views) {
+                    NativeView &view = view_entry.second;
+                    if (!view.hwnd || GetAncestor(view.hwnd, GA_ROOT) != hwnd) continue;
+                    applyNativeViewFrame(host, view);
+                    if (view.kind != kViewGpuSurface) continue;
+                    const double surface_scale = gpuSurfaceScale(view.hwnd);
+                    double width = 0;
+                    double height = 0;
+                    if (gpuSurfaceLogicalSize(view, view.hwnd, surface_scale, &width, &height)) {
+                        (void)syncGpuSurfaceGeometry(host, view, width, height, surface_scale);
+                    }
+                }
+#if NATIVE_SDK_HAS_WEBVIEW2
+                for (auto &webview_entry : host->webviews) {
+                    ChildWebView &webview = webview_entry.second;
+                    /* Explicit frames are LOGICAL points scaled to
+                     * physical pixels at apply time, so a monitor-scale
+                     * change strands them until re-applied here. The
+                     * auto-fill main webview stores PHYSICAL client-rect
+                     * pixels and already re-derived them in the WM_SIZE
+                     * that the SetWindowPos above dispatched, so it is
+                     * skipped. */
+                    if (!webview.frame_explicit) continue;
+                    if (!webview.hwnd || GetAncestor(webview.hwnd, GA_ROOT) != hwnd) continue;
+                    applyWebViewFrame(webview);
+                }
+#endif
+                return 0;
+            }
+            break;
         case WM_TIMER:
             if (host && handleAppTimerMessage(host, wparam)) return 0;
             if (host && handleAudioTimerMessage(host, wparam)) return 0;
@@ -4558,20 +5188,26 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                     Window &window = entry.second;
                     if (window.hwnd != hwnd) continue;
                     if (window.min_width <= 0 && window.min_height <= 0) break;
-                    /* The declared floor is a CONTENT size; convert to the
-                     * outer track size for this window's current style.
-                     * Hidden titlebar styles carry no top chrome (the
-                     * custom WM_NCCALCSIZE hands the caption band to the
-                     * client), so their conversion skips it too. */
-                    RECT frame = { 0, 0, (LONG)(window.min_width > 0 ? window.min_width : 0), (LONG)(window.min_height > 0 ? window.min_height : 0) };
+                    /* The declared floor is a CONTENT size in LOGICAL
+                     * points; scale to physical pixels at this window's
+                     * DPI, then convert to the outer track size for its
+                     * current style. Hidden titlebar styles carry no top
+                     * chrome (the custom WM_NCCALCSIZE hands the caption
+                     * band to the client), so their conversion skips it
+                     * too. */
+                    const UINT dpi = dpiForWindow(hwnd);
+                    const double scale = (double)dpi / 96.0;
+                    const double min_content_width = window.min_width > 0 ? window.min_width * scale : 0;
+                    const double min_content_height = window.min_height > 0 ? window.min_height * scale : 0;
+                    RECT frame = { 0, 0, physicalContentExtent(min_content_width), physicalContentExtent(min_content_height) };
                     const DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
                     const DWORD ex_style = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     const bool has_menu = GetMenu(hwnd) != nullptr;
-                    AdjustWindowRectEx(&frame, style, has_menu, ex_style);
+                    adjustWindowRectForDpi(&frame, style, has_menu, ex_style, dpi);
                     LONG outer_width = frame.right - frame.left;
                     LONG outer_height = frame.bottom - frame.top;
                     if (windowUsesHiddenTitlebar(window)) {
-                        const SIZE outer = hiddenOuterSizeForContent(style, ex_style, has_menu, window.min_width > 0 ? window.min_width : 0, window.min_height > 0 ? window.min_height : 0);
+                        const SIZE outer = hiddenOuterSizeForContent(style, ex_style, has_menu, min_content_width, min_content_height, dpi);
                         outer_width = outer.cx;
                         outer_height = outer.cy;
                     }
@@ -4588,6 +5224,38 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             if (host) emitAppearanceIfChanged(host, false);
             break;
         case WM_CLOSE:
+            /* close_policy .hide: the user's close (caption X, Alt+F4)
+             * hides the window instead of destroying it — the hwnd and
+             * every view stay live, the app keeps running behind its
+             * tray icon, and the frame event reports the hidden state.
+             * Runtime-initiated closes call DestroyWindow directly
+             * (native_sdk_windows_close_window) and bypass this hook. */
+            if (host) {
+                for (auto &entry : host->windows) {
+                    if (entry.second.hwnd == hwnd && entry.second.close_policy == 1) {
+                        /* The hide is honest only while a tray icon is
+                         * live: SW_HIDE removes the taskbar entry and
+                         * Windows has no dock-reopen path, so without a
+                         * tray the hidden window is a running, invisible,
+                         * unreachable app. tray_active is set only when
+                         * Shell_NotifyIcon actually added the icon, so a
+                         * declared tray whose creation FAILED at runtime
+                         * lands here too. The trade: consulting the live
+                         * state at close time means a close that arrives
+                         * before the app installs its tray (or after it
+                         * removes it) really closes — a loud, visible
+                         * close beats a silently stranded process. */
+                        if (!host->tray_active) {
+                            fprintf(stderr, "native-sdk: close_policy \"hide\" downgraded to a real close: no live tray icon exists (tray creation failed or no status item was installed), so a hidden window would have no re-show affordance\n");
+                            break;
+                        }
+                        entry.second.policy_hidden = true;
+                        ShowWindow(hwnd, SW_HIDE);
+                        emit(host, entry.second, kWindowFrame);
+                        return 0;
+                    }
+                }
+            }
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
@@ -4597,6 +5265,8 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                         destroyNativeViewsForWindow(host, entry.first);
                         destroyChildWebViewsForWindow(host, entry.first);
                         entry.second.hwnd = nullptr;
+                        /* Destroyed means closed, never hidden. */
+                        entry.second.policy_hidden = false;
                         emit(host, entry.second, kWindowFrame);
                     }
                 }
@@ -4640,19 +5310,26 @@ static bool createNativeWindow(Host *host, Window &window) {
         style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX;
         if (window.resizable) style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
     }
-    /* The requested frame is a CONTENT size (the other hosts size the
-     * content area); grow it to the outer size for this style so the
-     * client rect lands at the request. The menu bar is attached after
-     * creation, so account for it here when menus are declared. Hidden
-     * styles use the custom-calc shape (no top chrome) — plain
-     * AdjustWindowRectEx would land their client one caption band tall. */
+    /* The requested frame is a CONTENT size in LOGICAL points (the
+     * other hosts size the content area); scale it to physical pixels
+     * at the DPI the window opens at (the system DPI — WM_DPICHANGED
+     * re-derives the frame if it lands on another monitor), then grow
+     * it to the outer size for this style so the client rect lands at
+     * the request. The menu bar is attached after creation, so account
+     * for it here when menus are declared. Hidden styles use the
+     * custom-calc shape (no top chrome) — plain adjustment would land
+     * their client one caption band tall. */
     const bool has_menu = !host->menus.empty();
-    RECT frame = { 0, 0, (LONG)window.width, (LONG)window.height };
-    AdjustWindowRectEx(&frame, style, has_menu ? TRUE : FALSE, 0);
+    const UINT dpi = systemDpi();
+    const double scale = (double)dpi / 96.0;
+    const double content_width = window.width * scale;
+    const double content_height = window.height * scale;
+    RECT frame = { 0, 0, physicalContentExtent(content_width), physicalContentExtent(content_height) };
+    adjustWindowRectForDpi(&frame, style, has_menu ? TRUE : FALSE, 0, dpi);
     LONG outer_width = frame.right - frame.left;
     LONG outer_height = frame.bottom - frame.top;
     if (windowUsesHiddenTitlebar(window)) {
-        const SIZE outer = hiddenOuterSizeForContent(style, 0, has_menu, window.width, window.height);
+        const SIZE outer = hiddenOuterSizeForContent(style, 0, has_menu, content_width, content_height, dpi);
         outer_width = outer.cx;
         outer_height = outer.cy;
     }
@@ -4673,6 +5350,9 @@ static bool createNativeWindow(Host *host, Window &window) {
     DragAcceptFiles(hwnd, TRUE);
     window.hwnd = hwnd;
     applyMenusToWindow(host, window);
+    /* Before the first show, so a dark-scheme launch never flashes a
+     * light caption. */
+    applyStandardTitlebarColorScheme(window);
     if (windowUsesHiddenTitlebar(window)) {
         applyHiddenTitlebarFrame(window);
         /* The create-time WM_NCCALCSIZE ran before this window was
@@ -4706,6 +5386,15 @@ Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const
     InitCommonControlsEx(&controls);
 
     Host *host = new Host();
+    /* The WebView2 environment factory requires a single-threaded
+     * apartment on the calling thread; without one it fails with
+     * CO_E_NOTINITIALIZED. Create, run, and destroy all execute on the
+     * app's main thread, so one init here pairs with the CoUninitialize
+     * at the end of native_sdk_windows_destroy — after the controllers
+     * are closed. S_FALSE (already initialized) still pairs;
+     * RPC_E_CHANGED_MODE (an MTA got there first) leaves nothing to
+     * balance. */
+    host->com_initialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
     host->app_name = slice(app_name, app_name_len);
     host->window_title = slice(window_title, window_title_len);
     host->bundle_id = slice(bundle_id, bundle_id_len);
@@ -4749,7 +5438,9 @@ void native_sdk_windows_destroy(Host *host) {
     audioReleaseSession(host, true);
     removeNotificationIcon(host);
     destroyAllWindows(host);
+    const bool com_initialized = host->com_initialized;
     delete host;
+    if (com_initialized) CoUninitialize();
 }
 
 void native_sdk_windows_run(Host *host, EventCallback callback, void *context) {
@@ -5265,6 +5956,47 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
     return 1;
 }
 
+/* The show verb: bring the window back to the glass and foreground it —
+ * the counterpart to a close_policy hide (and the tray-menu "Open"
+ * consequence). Restores a minimized window on the way. */
+int native_sdk_windows_show_window(Host *host, uint64_t window_id) {
+    if (!host) return 0;
+    auto found = host->windows.find(window_id);
+    if (found == host->windows.end() || !found->second.hwnd) return 0;
+    found->second.policy_hidden = false;
+    ShowWindow(found->second.hwnd, IsIconic(found->second.hwnd) ? SW_RESTORE : SW_SHOW);
+    /* Re-show returns full frame cadence without dropping a beat, the
+     * same supersede the top-level WM_SIZE handler runs on restore:
+     * SW_SHOW on a same-size window dispatches no WM_SIZE, so a
+     * heartbeat-paced emission parked up to a second out on a child
+     * surface's one-shot timer is re-armed here at the frame-grid
+     * delay (policy_hidden just cleared, so the scheduler paces on the
+     * grid again; SetTimer with the same id replaces the pending
+     * timer). */
+    for (auto &view_entry : host->native_views) {
+        NativeView &surface = view_entry.second;
+        if (surface.kind != kViewGpuSurface || !surface.hwnd || !surface.gpu_emission_scheduled) continue;
+        if (surface.window_id != window_id) continue;
+        surface.gpu_emission_scheduled = false;
+        gpuSurfaceScheduleFrameEmission(host, surface);
+    }
+    SetForegroundWindow(found->second.hwnd);
+    SetFocus(found->second.hwnd);
+    emit(host, found->second, kWindowFrame);
+    return 1;
+}
+
+/* What the user's close affordance does: 0 = quit (destroy; the
+ * default), 1 = hide (SW_HIDE and keep running). Applied right after
+ * create — close handling is host window state for the window's life. */
+int native_sdk_windows_set_window_close_policy(Host *host, uint64_t window_id, int close_policy) {
+    if (!host) return 0;
+    auto found = host->windows.find(window_id);
+    if (found == host->windows.end()) return 0;
+    found->second.close_policy = close_policy;
+    return 1;
+}
+
 int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
     if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
     auto window = host->windows.find(window_id);
@@ -5367,16 +6099,17 @@ int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *l
     }
     if (view.visible) style |= WS_VISIBLE;
 
-    POINT origin = nativeViewAbsoluteOrigin(host, view);
+    const double scale = nativeViewFrameScale(host, view);
+    RECT frame = nativeViewPhysicalFrame(host, view, scale);
     HWND hwnd = CreateWindowExW(
         ex_style,
         class_name.c_str(),
         wide_text.c_str(),
         style,
-        origin.x,
-        origin.y,
-        nativeViewExtent(width),
-        nativeViewExtent(height),
+        frame.left,
+        frame.top,
+        frame.right - frame.left,
+        frame.bottom - frame.top,
         window->second.hwnd,
         nullptr,
         host->instance,
@@ -5410,7 +6143,7 @@ int native_sdk_windows_request_gpu_surface_frame(Host *host, uint64_t window_id,
      * frame-event scheduler: repaint retained content and arm the next
      * grid-paced emission (folding into one already in flight). */
     InvalidateRect(found->second.hwnd, nullptr, FALSE);
-    gpuSurfaceScheduleFrameEmission(found->second);
+    gpuSurfaceScheduleFrameEmission(host, found->second);
     return 1;
 }
 
@@ -5428,8 +6161,42 @@ int native_sdk_windows_note_gpu_surface_input(Host *host, uint64_t window_id, co
     view.gpu_prompt_frame_pending = true;
     if (view.gpu_emission_scheduled) {
         view.gpu_emission_scheduled = false;
-        gpuSurfaceScheduleFrameEmission(view);
+        gpuSurfaceScheduleFrameEmission(host, view);
     }
+    return 1;
+}
+
+/* Queue the app context menu for presentation. Called on the loop
+ * thread mid event dispatch (the runtime asks from inside its input
+ * handling), so the request is copied out of the caller's borrowed
+ * memory and presentation defers to a fresh loop turn via PostMessageW —
+ * the same two-step the macOS host performs (its dispatch_async before
+ * popUpMenuPositioningItem). The window procedure's
+ * kShowContextMenuMessage case runs showAppContextMenu, whose
+ * TrackPopupMenu blocks in its own modal loop and whose selection (or
+ * dismissal) emits the kContextMenuAction event carrying `token`. */
+int native_sdk_windows_show_context_menu(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, uint64_t token, const WindowsContextMenuItem *items, size_t count) {
+    if (!host || !items || count == 0) return 0;
+    auto found = host->windows.find(window_id);
+    if (found == host->windows.end() || !found->second.hwnd) return 0;
+    PendingContextMenu pending;
+    pending.active = true;
+    pending.window_id = window_id;
+    pending.view_label = slice(label, label_len);
+    pending.x = x;
+    pending.y = y;
+    pending.token = token;
+    pending.items.reserve(count);
+    for (size_t index = 0; index < count; index++) {
+        PendingContextMenu::Item item;
+        item.id = items[index].item_id;
+        item.label = slice(items[index].label, items[index].label_len);
+        item.enabled = items[index].enabled != 0;
+        item.separator = items[index].separator != 0;
+        pending.items.push_back(std::move(item));
+    }
+    host->context_menu = std::move(pending);
+    PostMessageW(found->second.hwnd, kShowContextMenuMessage, 0, 0);
     return 1;
 }
 
@@ -5496,7 +6263,7 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
     const bool first_present = !view.gpu_presented;
     view.gpu_presented = true;
     if (first_present) view.gpu_prompt_frame_pending = true;
-    gpuSurfaceScheduleFrameEmission(view);
+    gpuSurfaceScheduleFrameEmission(host, view);
     return 1;
 }
 
@@ -5923,15 +6690,19 @@ int native_sdk_windows_create_webview(Host *host, uint64_t window_id, const char
     if (host->webviews.find(key) != host->webviews.end()) return 0;
 
     std::string url_string = slice(url, url_len);
+    /* The requested frame is in logical points (frame_explicit child
+     * webviews scale like native view frames); physical placement at
+     * the owning window's DPI. */
+    const double frame_scale = (double)dpiForWindow(window->second.hwnd) / 96.0;
     HWND hwnd = CreateWindowExW(
         0,
         L"STATIC",
         L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-        webViewCoord(x),
-        webViewCoord(y),
-        webViewExtent(width),
-        webViewExtent(height),
+        webViewCoord(x * frame_scale),
+        webViewCoord(y * frame_scale),
+        webViewExtent(width * frame_scale),
+        webViewExtent(height * frame_scale),
         window->second.hwnd,
         nullptr,
         host->instance,
@@ -5973,7 +6744,8 @@ int native_sdk_windows_set_webview_frame(Host *host, uint64_t window_id, const c
     found->second.width = width;
     found->second.height = height;
     found->second.frame_explicit = true;
-    MoveWindow(found->second.hwnd, webViewCoord(x), webViewCoord(y), webViewExtent(width), webViewExtent(height), TRUE);
+    const double frame_scale = webViewFrameScale(found->second);
+    MoveWindow(found->second.hwnd, webViewCoord(x * frame_scale), webViewCoord(y * frame_scale), webViewExtent(width * frame_scale), webViewExtent(height * frame_scale), TRUE);
 #if NATIVE_SDK_HAS_WEBVIEW2
     if (found->second.controller) {
         RECT bounds = webViewRect(found->second);

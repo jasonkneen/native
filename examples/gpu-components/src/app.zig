@@ -64,7 +64,7 @@ const componentSizesEqual = component_scene.componentSizesEqual;
 const componentTokensForScaleMotionAndContrast = component_scene.componentTokensForScaleMotionAndContrast;
 const componentThemeModeForAppearance = component_scene.componentThemeModeForAppearance;
 const normalizedPixelSnapScale = component_scene.normalizedPixelSnapScale;
-const buildComponentsWidgetLayoutWithStateAndSize = component_scene.buildComponentsWidgetLayoutWithStateAndSize;
+const buildComponentsWidgetLayoutWithStateSizeAndTokens = component_scene.buildComponentsWidgetLayoutWithStateSizeAndTokens;
 const surfaceOverlayKind = component_scene.surfaceOverlayKind;
 const surfaceOverlayFrameForSidebar = component_scene.surfaceOverlayFrameForSidebar;
 const gpuFrameEvent = component_scene.gpuFrameEvent;
@@ -183,7 +183,7 @@ pub const GpuComponentsApp = struct {
             .canvas_widget_keyboard => |keyboard_event| try self.handleWidgetKeyboard(runtime, keyboard_event),
             .canvas_widget_dismiss => |dismiss_event| try self.handleWidgetDismiss(runtime, dismiss_event),
             .appearance_changed => |appearance| try self.applySystemAppearance(runtime, appearance),
-            .gpu_surface_resized, .gpu_surface_input, .shortcut, .timer, .effects_wake, .audio, .files_dropped, .canvas_widget_scroll, .canvas_widget_file_drop, .canvas_widget_drag, .canvas_widget_context_menu, .canvas_widget_context_menu_request, .canvas_widget_context_press, .canvas_widget_resize, .canvas_widget_change, .window_closed, .automation_provenance, .lifecycle => {},
+            .gpu_surface_resized, .gpu_surface_input, .shortcut, .timer, .effects_wake, .audio, .video, .files_dropped, .canvas_widget_scroll, .canvas_widget_file_drop, .canvas_widget_drag, .canvas_widget_context_menu, .canvas_widget_context_menu_shown, .canvas_widget_context_menu_dismissed, .canvas_widget_context_menu_request, .canvas_widget_context_press, .canvas_widget_resize, .canvas_widget_change, .window_closed, .automation_provenance, .lifecycle => {},
         }
     }
 
@@ -656,7 +656,12 @@ pub const GpuComponentsApp = struct {
 
     pub fn updateComponentsCanvasModel(self: *@This(), runtime: *native_sdk.Runtime, window_id: native_sdk.WindowId) anyerror!void {
         var nodes: [max_component_widgets]canvas.WidgetLayoutNode = undefined;
-        const layout = try buildComponentsWidgetLayoutWithStateAndSize(&nodes, self.virtual_scroll, self.componentUiState(), self.canvas_size);
+        // Layout under the SAME tokens the display list is emitted
+        // with: under geometry pixel snapping, label-hugging intrinsic
+        // widths ceil to the snap grid, and only a token-matched layout
+        // keeps the renderer's edge snapping from shaving those widths
+        // below their labels (eliding text that fits unsnapped).
+        const layout = try buildComponentsWidgetLayoutWithStateSizeAndTokens(&nodes, self.virtual_scroll, self.componentUiState(), self.canvas_size, self.componentTokens());
         _ = try runtime.setCanvasWidgetLayout(window_id, canvas_label, layout);
         _ = try runtime.emitCanvasWidgetDisplayListWithStoredTokensAndChrome(window_id, canvas_label, .{
             .prefix_command_count = component_chrome_prefix_commands,
@@ -716,7 +721,7 @@ pub const GpuComponentsApp = struct {
         };
     }
 
-    fn componentVirtualScrollState(self: *@This(), id: canvas.ObjectId, viewport_extent: f32, content_extent: f32) ?canvas.ScrollState {
+    fn componentVirtualScrollState(self: *@This(), id: canvas.ObjectId, viewport_extent: f32, content_extent: f32) ?canvas.ScrollAxisState {
         const offset = self.componentVirtualScrollValue(id) orelse return null;
         const velocity = self.componentVirtualScrollVelocity(id) orelse return null;
         return .{
@@ -749,7 +754,7 @@ pub const GpuComponentsApp = struct {
         }
     }
 
-    fn setComponentVirtualScrollState(self: *@This(), id: canvas.ObjectId, state: canvas.ScrollState) anyerror!void {
+    fn setComponentVirtualScrollState(self: *@This(), id: canvas.ObjectId, state: canvas.ScrollAxisState) anyerror!void {
         switch (id) {
             120 => {
                 self.virtual_scroll.nav = state.offset;

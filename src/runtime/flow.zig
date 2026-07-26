@@ -12,6 +12,7 @@ const launch_timing = @import("launch_timing.zig");
 const runtime_clock = @import("clock.zig");
 const shell_layout = @import("shell_layout.zig");
 const runtime_builtin_bridge = @import("builtin_bridge.zig");
+const runtime_canvas_widget_events = @import("canvas_widget_events.zig");
 const runtime_canvas_widget_context_menu = @import("canvas_widget_context_menu.zig");
 const runtime_canvas_widget_scroll_drivers = @import("canvas_widget_scroll_drivers.zig");
 const runtime_gpu_surface_events = @import("gpu_surface_events.zig");
@@ -38,6 +39,7 @@ const parseAutomationProvenanceTarget = automation_commands.parseAutomationProve
 const parseAutomationWidgetWheel = automation_commands.parseAutomationWidgetWheel;
 const parseAutomationWidgetContextMenuItem = automation_commands.parseAutomationWidgetContextMenuItem;
 const parseAutomationWidgetKey = automation_commands.parseAutomationWidgetKey;
+const parseAutomationWidgetPinch = automation_commands.parseAutomationWidgetPinch;
 const parseAutomationWidgetPointerDrag = automation_commands.parseAutomationWidgetPointerDrag;
 const parseAutomationResizeCommand = automation_commands.parseAutomationResizeCommand;
 const parseAutomationTrayItemId = automation_commands.parseAutomationTrayItemId;
@@ -74,6 +76,10 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
 
         fn ContextMenuMethods() type {
             return runtime_canvas_widget_context_menu.RuntimeCanvasWidgetContextMenu(Runtime);
+        }
+
+        fn CanvasWidgetEventMethods() type {
+            return runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(Runtime);
         }
 
         fn AutomationWidgetMethods() type {
@@ -129,6 +135,16 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
             // Stopped (joined) before the platform loop's resources go
             // away, so the watcher can never call into a dead host.
             defer if (command_watcher_running) command_watcher.stop();
+
+            // Media-surface wake teardown: producers a slow app forgot
+            // to release may push (and try to wake this platform) at
+            // any later time from their own threads. Disarm their wake
+            // bindings before the caller's later-declared defers tear
+            // the host down — declared BEFORE the app-stop defer below
+            // so it runs AFTER the stop hook (LIFO), letting the hook
+            // join producer threads first. The same run-exit ordering
+            // that stops the automation arrival watcher.
+            defer self.disarmMediaSurfaceWakes();
 
             // Teardown ordering contract: everything the app must do
             // against the live platform — silencing an active audio
@@ -226,10 +242,25 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                     log(self, "app.start", "app started", &.{trace.string("app", app.name)});
                 },
                 .app_activated => {
+                    try WindowViewMethods().setAppActive(self, true);
                     try dispatchEvent(self, app, .{ .lifecycle = .activate });
                     emitAppLifecycleEvent(self, "app:activate") catch |err| log(self, "app.activate.emit_failed", @errorName(err), &.{});
                 },
                 .app_deactivated => {
+                    // The app-active register flips FIRST — before the
+                    // tooltip reset and before the app hears the
+                    // lifecycle event — so a model that rebuilds FROM
+                    // its deactivation callback adopts under a runtime
+                    // that already knows the app is inactive: the
+                    // adoption arm's reveal/arm paths are gated on this
+                    // register and stay silent.
+                    try WindowViewMethods().setAppActive(self, false);
+                    // Deactivation drops every tooltip conversation in
+                    // every window (see the seam's own rationale) BEFORE
+                    // the app hears the lifecycle event, so a model that
+                    // rebuilds on deactivate adopts against clean
+                    // tooltip state instead of a stale shown slot.
+                    try CanvasWidgetEventMethods().resetCanvasTooltipIntentForAppDeactivation(self);
                     try dispatchEvent(self, app, .{ .lifecycle = .deactivate });
                     emitAppLifecycleEvent(self, "app:deactivate") catch |err| log(self, "app.deactivate.emit_failed", @errorName(err), &.{});
                 },
@@ -305,7 +336,21 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                     }
                 },
                 .window_focused => |window_id| {
-                    if (WindowViewMethods().findWindowIndexById(self, window_id)) |index| WindowViewMethods().setFocusedIndex(self, index);
+                    // setFocusedIndex is the window-key seam: the
+                    // window LOSING key here also drops its views'
+                    // tooltip conversations there.
+                    if (WindowViewMethods().findWindowIndexById(self, window_id)) |index| try WindowViewMethods().setFocusedIndex(self, index);
+                    self.invalidated = true;
+                },
+                .view_focused => |focus| {
+                    // Native children (notably embedded webviews) own
+                    // their pointer stream, so the host reports the
+                    // focus edge explicitly. Keep the canvas widget id
+                    // as per-view focus memory while its view blurs:
+                    // inactive terminal/text carets paint honestly, and
+                    // clicking back into the canvas resumes its normal
+                    // pointer-driven widget focus path.
+                    try WindowViewMethods().setFocusedView(self, focus.window_id, focus.label);
                     self.invalidated = true;
                 },
                 .frame_requested => try frame(self, app),
@@ -399,6 +444,9 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 .audio => |audio_event| {
                     try dispatchEvent(self, app, .{ .audio = audio_event });
                 },
+                .video => |video_event| {
+                    try dispatchEvent(self, app, .{ .video = video_event });
+                },
                 .wake => {
                     try dispatchEvent(self, app, .effects_wake);
                 },
@@ -464,6 +512,7 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 .timer => {},
                 .effects_wake => {},
                 .audio => {},
+                .video => {},
                 .files_dropped => {},
                 .gpu_surface_frame => {},
                 .gpu_surface_resized => {},
@@ -476,6 +525,12 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 .canvas_widget_context_menu => {
                     self.invalidateFor(.command, null);
                 },
+                // The shown notice only arms UiApp's selection snapshot:
+                // no visual change (the popover is an OS surface).
+                .canvas_widget_context_menu_shown => {},
+                // The dismissal notice only disarms UiApp's snapshot and
+                // pin: no visual change either.
+                .canvas_widget_context_menu_dismissed => {},
                 .canvas_widget_context_menu_request => {
                     // The app loop answers by mounting the anchored
                     // fallback surface: a visual change.
@@ -500,6 +555,18 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
 
         pub fn frame(self: *Runtime, app: App) anyerror!void {
             const start_ns = nowNanoseconds();
+            // A media-surface producer's wake arrives as THIS event (the
+            // platform's cross-thread frame request): adopt staged
+            // frames here so an idle app's push reaches the runtime —
+            // adoption's invalidation then arms the prompt gpu-surface
+            // frame that composites it (`noteCanvasImagesChanged` ->
+            // `requestCanvasFrameForView`). Runs before the invalidation
+            // check below because adoption IS an invalidation source; a
+            // busy app pays one fenced flag check per idle channel, and
+            // the gpu-surface frame dispatch's own adoption call keeps
+            // pacing consumption for hosts whose frame events do not
+            // pass through here.
+            self.adoptMediaSurfaceFrames();
             try consumeAutomationCommand(self, app);
             if (!self.invalidated) return;
 
@@ -551,6 +618,9 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
         }
 
         fn loadStartupWindows(self: *Runtime, app: App) anyerror!void {
+            // Scene-less startup always materializes the app's webview
+            // source into the main window; a native-only build cannot.
+            if (!self.options.web_layer) return error.WebViewLayerNotBuilt;
             const source = try WindowViewMethods().copyLoadedSource(self, try app.webViewSource());
             self.loaded_source = source;
             const app_info = self.options.platform.app_info;
@@ -569,6 +639,23 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 };
                 self.windows[runtime_index].source_reloads_from_app = true;
                 if (index > 0) {
+                    // The same `.hide` gate as the runtime create path
+                    // (window_storage): secondary startup windows reach
+                    // the platform through this direct create, so the
+                    // policy check must ride here too or a declared
+                    // `.hide` is silently accepted on hosts that cannot
+                    // re-show a closed window. `.hide` needs a host that
+                    // can keep a closed-by-the-user window alive and
+                    // re-show it; refusing here is the loud teaching
+                    // (GTK: no status item exists to bring the window
+                    // back, declare .quit — the default — instead).
+                    // NEVER a silent no-op that strands a hidden window.
+                    // The main window (index 0) is created by the host
+                    // itself, which refuses the declaration at its own
+                    // init.
+                    if (window.close_policy == .hide and !self.options.platform.supports(.window_hide_on_close)) {
+                        return error.UnsupportedWindowClosePolicy;
+                    }
                     _ = try self.options.platform.services.createWindow(window);
                 }
                 try self.options.platform.services.loadWindowWebView(window.id, self.windows[runtime_index].source.?);
@@ -592,6 +679,7 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 try WindowViewMethods().copyLoadedSource(self, try app.webViewSource())
             else
                 null;
+            if (source != null and !self.options.web_layer) return error.WebViewLayerNotBuilt;
             self.loaded_source = source;
 
             try loadStartupSceneWindow(self, scene.windows[0], source);
@@ -661,12 +749,16 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
         }
 
         fn loadWebView(self: *Runtime, app: App) anyerror!void {
+            if (!self.options.web_layer) return error.WebViewLayerNotBuilt;
             const source = try WindowViewMethods().copyLoadedSource(self, try app.webViewSource());
             self.loaded_source = source;
             try self.options.platform.services.loadWindowWebView(1, source);
         }
 
         pub fn reloadWindows(self: *Runtime, app: App) anyerror!void {
+            // Reload re-materializes webview sources; native-only builds
+            // have none to reload.
+            if (!self.options.web_layer) return error.WebViewLayerNotBuilt;
             const source = try WindowViewMethods().copyLoadedSource(self, try app.webViewSource());
             self.loaded_source = source;
             if (self.window_count == 0) {
@@ -785,6 +877,7 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 .widget_drag => "automation.widget_drag",
                 .widget_wheel => "automation.widget_wheel",
                 .widget_key => "automation.widget_key",
+                .widget_pinch => "automation.widget_pinch",
                 .tray_action => "automation.tray_action",
                 .provenance => "automation.provenance",
                 else => "automation.command",
@@ -845,6 +938,9 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 },
                 .widget_key => {
                     try AutomationWidgetMethods().dispatchAutomationWidgetKeyInput(self, app, try parseAutomationWidgetKey(command.value));
+                },
+                .widget_pinch => {
+                    try AutomationWidgetMethods().dispatchAutomationWidgetPinch(self, app, try parseAutomationWidgetPinch(command.value));
                 },
                 .menu_command => {
                     try dispatchPlatformEvent(self, app, .{ .menu_command = .{
@@ -1123,7 +1219,7 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
         /// app: record it in the bounded ring (queryable through
         /// `Runtime.dispatchErrors` and the automation snapshot), trace
         /// it at `.err`, and republish observable state.
-        fn recordDispatchError(self: *Runtime, event_name: []const u8, err: anyerror) void {
+        pub fn recordDispatchError(self: *Runtime, event_name: []const u8, err: anyerror) void {
             recordDispatchErrorDetail(self, event_name, err, "");
         }
 
@@ -1135,9 +1231,9 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
             self.dispatch_error_total +%= 1;
             var record: automation.snapshot.DispatchError = .{
                 .timestamp_ns = runtime_clock.timestampToU64(nowNanoseconds()),
-                .event = event_name,
                 .error_name = @errorName(err),
             };
+            record.setEvent(event_name);
             record.setDetail(detail);
             if (self.dispatch_error_len == self.dispatch_errors.len) {
                 std.mem.copyForwards(automation.snapshot.DispatchError, self.dispatch_errors[0 .. self.dispatch_errors.len - 1], self.dispatch_errors[1..]);

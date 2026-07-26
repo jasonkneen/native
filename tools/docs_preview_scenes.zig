@@ -172,6 +172,8 @@ pub const scenes = [_]Scene{
     .{ .name = "skeleton", .height = 200, .build = stateless(buildSkeleton) },
     .{ .name = "spinner", .height = 140, .build = stateless(buildSpinner) },
     .{ .name = "markdown", .height = 440, .build = stateless(buildMarkdown) },
+    .{ .name = "media-surface", .height = 280, .build = stateless(buildMediaSurface) },
+    .{ .name = "video", .height = 300, .build = stateless(buildVideo) },
     .{ .name = "icon", .height = 150, .build = stateless(buildIconHero) },
     .{ .name = "chart", .height = 260, .build = stateless(buildChart) },
     .{ .name = "chart-bar", .height = 260, .build = stateless(buildChartBar) },
@@ -204,6 +206,8 @@ pub const scenes = [_]Scene{
     heroScene("input-group-hero", buildInputGroupHero),
     heroScene("list-hero", buildListHero),
     heroScene("markdown-hero", buildMarkdownHero),
+    heroScene("media-surface-hero", buildMediaSurfaceHero),
+    heroScene("video-hero", buildVideoHero),
     heroScene("pagination-hero", buildPaginationHero),
     heroScene("panel-hero", buildPanelHero),
     heroScene("progress-hero", buildProgressHero),
@@ -576,6 +580,65 @@ fn buildAvatar(ui: *Ui) Node {
     });
 }
 
+fn buildMediaSurface(ui: *Ui) Node {
+    // The docs previews render through the deterministic reference
+    // renderer, so this shows exactly what goldens show: the surface's
+    // id-derived placeholder. Producer frames exist only on live GPU
+    // hosts — presentation chrome by policy.
+    return tile(ui, .{
+        ui.column(.{ .gap = 10, .width = 340 }, .{
+            ui.mediaSurface(.{
+                .image = 7,
+                .height = 180,
+                .style_tokens = .{ .radius = .md },
+                .semantics = .{ .label = "Camera preview" },
+            }),
+            ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Awaiting producer frames"),
+        }),
+    });
+}
+
+fn buildVideo(ui: *Ui) Node {
+    // Docs previews render through the deterministic reference
+    // renderer: the surface shows its placeholder and the house chrome
+    // its idle (no playback loaded) state — exactly what goldens show.
+    return tile(ui, .{
+        ui.column(.{ .gap = 10, .width = 360 }, .{
+            ui.video(.{
+                .src = "assets/clips/launch.mp4",
+                .controls = true,
+                .height = 200,
+                .label = "Launch clip",
+            }),
+            ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "House transport chrome under the picture"),
+        }),
+    });
+}
+
+fn buildVideoHero(ui: *Ui) Node {
+    return tile(ui, .{
+        ui.video(.{
+            .src = "assets/clips/launch.mp4",
+            .controls = true,
+            .width = 300,
+            .height = 168,
+            .label = "Video",
+        }),
+    });
+}
+
+fn buildMediaSurfaceHero(ui: *Ui) Node {
+    return tile(ui, .{
+        ui.mediaSurface(.{
+            .image = 7,
+            .width = 300,
+            .height = 150,
+            .style_tokens = .{ .radius = .md },
+            .semantics = .{ .label = "Media surface" },
+        }),
+    });
+}
+
 fn buildCard(ui: *Ui) Node {
     // No hand-added inset: the card composite carries the house 24px
     // content padding by default.
@@ -932,7 +995,7 @@ fn buildSheet(ui: *Ui) Node {
                 surfaceTitleSpacer(ui),
                 ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .text_muted } }, "Anyone with the link can view this board."),
                 ui.row(.{ .gap = 8 }, .{
-                    ui.el(.input, .{ .text = "https://zero-native.dev/b/9f2", .grow = 1 }, .{}),
+                    ui.el(.input, .{ .text = "https://native-sdk.dev/b/9f2", .grow = 1 }, .{}),
                     ui.button(.{ .variant = .secondary, .icon = "copy" }, "Copy"),
                 }),
             }),
@@ -986,7 +1049,7 @@ const markdown_sample =
     \\component.
     \\
     \\- Deterministic layout, selectable text
-    \\- [Links](https://zero-native.dev) dispatch a Msg
+    \\- [Links](https://native-sdk.dev) dispatch a Msg
     \\
     \\```zig
     \\const doc = try fx.readFile("notes.md");
@@ -1324,7 +1387,7 @@ const markdown_hero_sample =
     \\## Release notes
     \\
     \\The **markdown** widget renders rich text — *emphasis*,
-    \\`inline code`, and [links](https://zero-native.dev) — through
+    \\`inline code`, and [links](https://native-sdk.dev) — through
     \\native widgets.
 ;
 
@@ -1450,7 +1513,7 @@ fn buildSheetHero(ui: *Ui) Node {
                 surfaceTitleSpacer(ui),
                 ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .text_muted } }, "Anyone with the link can view this board."),
                 ui.row(.{ .gap = 8 }, .{
-                    ui.el(.input, .{ .text = "https://zero-native.dev/b/9f2", .grow = 1 }, .{}),
+                    ui.el(.input, .{ .text = "https://native-sdk.dev/b/9f2", .grow = 1 }, .{}),
                     ui.button(.{ .variant = .secondary, .icon = "copy" }, "Copy"),
                 }),
             }),

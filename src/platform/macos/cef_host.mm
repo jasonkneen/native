@@ -16,6 +16,7 @@
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
 #include "include/cef_application_mac.h"
+#include "include/cef_focus_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_process_message.h"
 #include "include/cef_values.h"
@@ -102,7 +103,7 @@ private:
     IMPLEMENT_REFCOUNTING(NativeSdkCefBridgeV8Handler);
 };
 
-class NativeSdkCefClient final : public CefClient, public CefLifeSpanHandler, public CefLoadHandler, public CefRequestHandler {
+class NativeSdkCefClient final : public CefClient, public CefLifeSpanHandler, public CefLoadHandler, public CefRequestHandler, public CefFocusHandler {
 public:
     explicit NativeSdkCefClient(NativeSdkChromiumHost *host, uint64_t window_id) : host_(host), window_id_(window_id) {}
     NativeSdkCefClient(NativeSdkChromiumHost *host, uint64_t window_id, std::string webview_key, uint64_t webview_generation, bool bridge_enabled) : host_(host), window_id_(window_id), webview_key_(webview_key), webview_generation_(webview_generation), bridge_enabled_(bridge_enabled) {}
@@ -119,8 +120,13 @@ public:
         return this;
     }
 
+    CefRefPtr<CefFocusHandler> GetFocusHandler() override {
+        return this;
+    }
+
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;
     void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
+    void OnGotFocus(CefRefPtr<CefBrowser> browser) override;
     void OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode, const CefString& errorText, const CefString& failedUrl) override;
     bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool user_gesture, bool is_redirect) override;
     bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) override;
@@ -477,6 +483,13 @@ static const char *NativeSdkCefBridgeScript() {
 @property(nonatomic, assign) BOOL observesContentLayout;
 @end
 
+/// NSApp's delegate (unretained by NSApp; the host keeps the strong
+/// ref). One job: the Dock-icon reopen re-shows windows hidden by
+/// their close_policy — mirrors the AppKit host's delegate.
+@interface NativeSdkChromiumAppDelegate : NSObject <NSApplicationDelegate>
+@property(nonatomic, assign) NativeSdkChromiumHost *host;
+@end
+
 @interface NativeSdkChromiumShortcut : NSObject
 @property(nonatomic, strong) NSString *identifier;
 @property(nonatomic, strong) NSString *key;
@@ -513,6 +526,11 @@ static const char *NativeSdkCefBridgeScript() {
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *assetOrigins;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *windowLabels;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *fallbackURLs;
+/// close_policy per window (0 = quit, 1 = hide) and the windows that
+/// policy currently hides — mirrors the AppKit host's bookkeeping.
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *windowClosePolicies;
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *policyHiddenWindows;
+@property(nonatomic, strong) id reopenDelegate;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSView *> *webviewViews;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *webviewPendingURLs;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *webviewPendingZooms;
@@ -535,6 +553,11 @@ static const char *NativeSdkCefBridgeScript() {
 @property(nonatomic, assign) void *context;
 @property(nonatomic, assign) void *bridgeContext;
 @property(nonatomic, assign) BOOL didShutdown;
+/* A quit verb that arrived before [NSApp run] (see
+ * native_sdk_appkit_request_stop): parked here, drained at top level
+ * by runWithCallback's drainPendingPreRunStop calls once the pre-run
+ * dispatch that carried it has returned. */
+@property(nonatomic, assign) BOOL pendingPreRunStop;
 @property(nonatomic, assign) BOOL observesApplicationActivation;
 @property(nonatomic, strong) id shortcutEventMonitor;
 @property(nonatomic, strong) NSArray<NativeSdkChromiumShortcut *> *shortcuts;
@@ -557,8 +580,13 @@ static const char *NativeSdkCefBridgeScript() {
 - (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable makeMain:(BOOL)makeMain;
 - (void)focusWindowWithId:(uint64_t)windowId;
 - (void)closeWindowWithId:(uint64_t)windowId;
+- (void)hideWindowWithId:(uint64_t)windowId;
+- (void)showWindowWithId:(uint64_t)windowId;
+- (void)miniaturizeWindowWithId:(uint64_t)windowId;
+- (BOOL)reopenPolicyHiddenWindows;
 - (void)runWithCallback:(native_sdk_appkit_event_callback_t)callback context:(void *)context;
 - (void)stop;
+- (BOOL)drainPendingPreRunStop;
 - (void)emitEvent:(native_sdk_appkit_event_t)event;
 - (void)startAppTimerWithId:(uint64_t)timerId intervalNs:(uint64_t)intervalNs repeats:(BOOL)repeats;
 - (void)cancelAppTimerWithId:(uint64_t)timerId;
@@ -573,6 +601,7 @@ static const char *NativeSdkCefBridgeScript() {
 - (void)emitWindowFrameForWindowId:(uint64_t)windowId open:(BOOL)open;
 - (void)emitFrame;
 - (void)emitShutdown;
+- (void)emitViewFocusedForWindowId:(uint64_t)windowId label:(NSString *)label;
 - (void)loadSource:(NSString *)source kind:(NSInteger)kind assetRoot:(NSString *)assetRoot entry:(NSString *)entry origin:(NSString *)origin spaFallback:(BOOL)spaFallback;
 - (void)loadSource:(NSString *)source kind:(NSInteger)kind assetRoot:(NSString *)assetRoot entry:(NSString *)entry origin:(NSString *)origin spaFallback:(BOOL)spaFallback windowId:(uint64_t)windowId;
 - (void)setAllowedNavigationOrigins:(NSArray<NSString *> *)origins externalURLs:(NSArray<NSString *> *)externalURLs externalAction:(NSInteger)externalAction;
@@ -675,6 +704,18 @@ static const char *NativeSdkCefBridgeScript() {
     [self.host emitResizeForWindowId:self.windowId];
 }
 
+// close_policy .hide: the user's close affordance hides the window
+// instead of closing it (mirrors the AppKit host). Runtime closes
+// never route through performClose: here, so they bypass this hook by
+// construction.
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    (void)sender;
+    NSNumber *policy = self.host.windowClosePolicies[@(self.windowId)];
+    if (policy.intValue != 1) return YES;
+    [self.host hideWindowWithId:self.windowId];
+    return NO;
+}
+
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
     if (self.observesContentLayout) {
@@ -682,9 +723,13 @@ static const char *NativeSdkCefBridgeScript() {
         [window removeObserver:self forKeyPath:@"contentLayoutRect"];
         self.observesContentLayout = NO;
     }
+    // A really-closing window is closed, not hidden: leave the set
+    // before the emit so open=false never carries hidden=true.
+    [self.host.policyHiddenWindows removeObject:@(self.windowId)];
     [self.host emitWindowFrameForWindowId:self.windowId open:NO];
     [self.host closeWebViewsInWindow:self.windowId];
     NSNumber *key = @(self.windowId);
+    [self.host.windowClosePolicies removeObjectForKey:key];
     [self.host.windows removeObjectForKey:key];
     [self.host.browserContainers removeObjectForKey:key];
     [self.host.delegates removeObjectForKey:key];
@@ -701,6 +746,18 @@ static const char *NativeSdkCefBridgeScript() {
         [self.host emitShutdown];
         [self.host stop];
     }
+}
+
+@end
+
+@implementation NativeSdkChromiumAppDelegate
+
+// Dock reopen with no visible windows: re-show policy-hidden windows
+// and answer NO (handled); otherwise keep AppKit's default behavior.
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+    (void)sender;
+    if (flag) return YES;
+    return ![self.host reopenPolicyHiddenWindows];
 }
 
 @end
@@ -729,6 +786,8 @@ static const char *NativeSdkCefBridgeScript() {
     self.assetOrigins = [[NSMutableDictionary alloc] init];
     self.windowLabels = [[NSMutableDictionary alloc] init];
     self.fallbackURLs = [[NSMutableDictionary alloc] init];
+    self.windowClosePolicies = [[NSMutableDictionary alloc] init];
+    self.policyHiddenWindows = [[NSMutableSet alloc] init];
     self.webviewViews = [[NSMutableDictionary alloc] init];
     self.webviewPendingURLs = [[NSMutableDictionary alloc] init];
     self.webviewPendingZooms = [[NSMutableDictionary alloc] init];
@@ -747,6 +806,7 @@ static const char *NativeSdkCefBridgeScript() {
 
     [self createWindowWithId:1 title:(title.length > 0 ? title : self.appName) label:@"main" x:0 y:0 width:width height:height restoreFrame:NO resizable:YES makeMain:YES];
     self.didShutdown = NO;
+    self.pendingPreRunStop = NO;
     self.observesApplicationActivation = NO;
     return self;
 }
@@ -918,6 +978,77 @@ static const char *NativeSdkCefBridgeScript() {
     [self emitWindowFrameForWindowId:windowId open:YES];
 }
 
+// close_policy .hide, the hiding half (mirrors the AppKit host): order
+// the window out, keep every host record, report the state on the
+// frame channel. The windows dictionary still owns the window, so the
+// count never reaches zero and no shutdown emits.
+- (void)hideWindowWithId:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)];
+    if (!window) return;
+    [self.policyHiddenWindows addObject:@(windowId)];
+    [window orderOut:nil];
+    [self emitWindowFrameForWindowId:windowId open:YES];
+}
+
+// The counterpart show verb: back to the glass, app activated.
+// SYNCHRONOUS on the main thread, exactly closeWindowWithId:'s
+// discipline (direct on main, dispatch_sync hop otherwise) — never a
+// queued dispatch_async. A show that returns success while its block
+// is still queued leaves the window in policyHiddenWindows during the
+// runtime's post-success bookkeeping, so frame emits in that gap carry
+// {focused:true, hidden:true}; and a show-then-close in one dispatch
+// re-orders — the queued show lands AFTER the synchronous close and
+// puts a retained (ordered-out) closed window back on the glass. The
+// window lookup lives INSIDE the block: for an off-main caller the
+// main thread may close the window before the hop lands, and the show
+// of a window that just left the table must be a no-op, not a
+// resurrection.
+- (void)showWindowWithId:(uint64_t)windowId {
+    void (^showBlock)(void) = ^{
+        NSWindow *window = self.windows[@(windowId)];
+        if (!window) return;
+        [self.policyHiddenWindows removeObject:@(windowId)];
+        if (window.miniaturized) [window deminiaturize:nil];
+        [window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        [self emitWindowFrameForWindowId:windowId open:YES];
+    };
+    if ([NSThread isMainThread]) {
+        showBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), showBlock);
+    }
+}
+
+// The real OS minimize verb, same synchronous main-thread discipline
+// as showWindowWithId: above (and for the same reason: a queued
+// miniaturize captured past a synchronous close genies an app-closed,
+// ordered-out window into the Dock). No frame emit — minimize moves no
+// runtime-mirrored window state; the host's occlusion reporting
+// follows from the OS state itself.
+- (void)miniaturizeWindowWithId:(uint64_t)windowId {
+    void (^miniaturizeBlock)(void) = ^{
+        NSWindow *window = self.windows[@(windowId)];
+        if (!window) return;
+        [window miniaturize:nil];
+    };
+    if ([NSThread isMainThread]) {
+        miniaturizeBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), miniaturizeBlock);
+    }
+}
+
+// Dock reopen consequence: re-show every policy-hidden window.
+// Returns whether any was re-shown.
+- (BOOL)reopenPolicyHiddenWindows {
+    if (self.policyHiddenWindows.count == 0) return NO;
+    for (NSNumber *key in [self.policyHiddenWindows copy]) {
+        [self showWindowWithId:key.unsignedLongLongValue];
+    }
+    return YES;
+}
+
 - (void)closeWindowWithId:(uint64_t)windowId {
     void (^closeBlock)(void) = ^{
         NSWindow *window = self.windows[@(windowId)];
@@ -928,6 +1059,19 @@ static const char *NativeSdkCefBridgeScript() {
         if (self.browsers) {
             auto it = self.browsers->find(windowId);
             if (it != self.browsers->end() && it->second) {
+                // This branch is a close EXIT that never reaches
+                // windowWillClose (the window is ordered out, not
+                // NSWindow-closed), so it must do the delegate's
+                // policy-hidden cleanup itself: leave the set BEFORE the
+                // emit — the frame encoder derives hidden from set
+                // membership, and open=false must never carry
+                // hidden=true — and so the Dock-reopen handler (which
+                // re-shows every set member) can never resurrect a
+                // window the app closed. After this, set membership
+                // implies a live, policy-hidden window: only
+                // hideWindowWithId adds (the user close of a live
+                // window), and every close exit removes.
+                [self.policyHiddenWindows removeObject:@(windowId)];
                 [window orderOut:nil];
                 [self emitWindowFrameForWindowId:windowId open:NO];
                 return;
@@ -946,6 +1090,14 @@ static const char *NativeSdkCefBridgeScript() {
     self.callback = callback;
     self.context = context;
 
+    // The Dock-reopen delegate (close_policy .hide's re-show path).
+    if (!NSApp.delegate) {
+        NativeSdkChromiumAppDelegate *reopenDelegate = [[NativeSdkChromiumAppDelegate alloc] init];
+        reopenDelegate.host = self;
+        self.reopenDelegate = reopenDelegate;
+        NSApp.delegate = reopenDelegate;
+    }
+
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     if (!self.shortcutEventMonitor) {
@@ -958,15 +1110,34 @@ static const char *NativeSdkCefBridgeScript() {
     }
 
     [self emitEvent:(native_sdk_appkit_event_t){ .kind = NATIVE_SDK_APPKIT_EVENT_START }];
+    // A VALID quit can arrive during the START dispatch (an update that
+    // returns fx.quitApp() at boot). Pre-run there is no queue turn to
+    // defer it to, so native_sdk_appkit_request_stop parked it — and
+    // THIS is its drain point: emitShutdown + stop run at top level,
+    // after the START dispatch has committed to the session recorder,
+    // never nested inside it (a nested emit seals the journal before
+    // the start record commits and replay refuses the recording).
+    [self drainPendingPreRunStop];
     // A failed START handler requests shutdown synchronously, before the
     // run loop exists — [NSApp stop:] is a no-op there. Honor the request
-    // here instead of stranding a live app behind a blank window.
+    // here instead of stranding a live app behind a blank window. (That
+    // request is the HOST side's native_sdk_appkit_stop, which keeps its
+    // inline pre-run emit — distinct from the quit verb's pending flag
+    // drained above.)
     if (self.didShutdown) {
         shutdownCefIfNeeded();
         return;
     }
     [self emitResize];
     [self emitWindowFrameForWindowId:1 open:YES];
+    // The resize/window-frame emits above are pre-run dispatches too —
+    // a boot command's update can return the quit verb during either.
+    // Drain the parked quit here at top level before the run-loop
+    // machinery arms; when it drains, the app never enters [NSApp run].
+    if ([self drainPendingPreRunStop]) {
+        shutdownCefIfNeeded();
+        return;
+    }
     [self startApplicationActivationObservers];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
                                                  target:self
@@ -1006,8 +1177,36 @@ static const char *NativeSdkCefBridgeScript() {
     [NSApp postEvent:event atStart:NO];
 }
 
+/* Drain the quit verb a pre-run dispatch parked (see
+ * native_sdk_appkit_request_stop): emitShutdown + stop at TOP LEVEL,
+ * strictly after the requesting dispatch returned, so the session
+ * recorder commits the requesting event before the shutdown record
+ * seals the journal. Answers YES only when it drained; a request that
+ * raced an already-emitted shutdown (a failed emit's inline stop) is
+ * consumed without a second emit. */
+- (BOOL)drainPendingPreRunStop {
+    if (!self.pendingPreRunStop) return NO;
+    self.pendingPreRunStop = NO;
+    if (self.didShutdown) return NO;
+    [self emitShutdown];
+    [self stop];
+    return YES;
+}
+
 - (void)emitEvent:(native_sdk_appkit_event_t)event {
     if (self.callback) self.callback(self.context, &event);
+}
+
+- (void)emitViewFocusedForWindowId:(uint64_t)windowId label:(NSString *)label {
+    NSWindow *window = self.windows[@(windowId)] ?: (windowId == 1 ? self.window : nil);
+    if (!window || label.length == 0) return;
+    const char *labelBytes = label.UTF8String ?: "";
+    [self emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_VIEW_FOCUSED,
+        .window_id = windowId,
+        .view_label = labelBytes,
+        .view_label_len = strlen(labelBytes),
+    }];
 }
 
 - (void)startApplicationActivationObservers {
@@ -1072,6 +1271,9 @@ static const char *NativeSdkCefBridgeScript() {
         .y = frame.origin.y,
         .open = open ? 1 : 0,
         .focused = window.isKeyWindow ? 1 : 0,
+        // Host truth: any frame emit while the window sits in the
+        // policy-hidden set carries the hidden flag.
+        .hidden = [self.policyHiddenWindows containsObject:@(windowId)] ? 1 : 0,
         .label = label.UTF8String,
         .label_len = [label lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
     }];
@@ -1716,6 +1918,21 @@ static NSString *NativeSdkShortcutKeyForEvent(NSEvent *event) {
         case NSDeleteFunctionKey: return @"delete";
         case NSHomeFunctionKey: return @"home";
         case NSEndFunctionKey: return @"end";
+        case NSPageUpFunctionKey: return @"pageup";
+        case NSPageDownFunctionKey: return @"pagedown";
+        case NSInsertFunctionKey: return @"insert";
+        case NSF1FunctionKey: return @"f1";
+        case NSF2FunctionKey: return @"f2";
+        case NSF3FunctionKey: return @"f3";
+        case NSF4FunctionKey: return @"f4";
+        case NSF5FunctionKey: return @"f5";
+        case NSF6FunctionKey: return @"f6";
+        case NSF7FunctionKey: return @"f7";
+        case NSF8FunctionKey: return @"f8";
+        case NSF9FunctionKey: return @"f9";
+        case NSF10FunctionKey: return @"f10";
+        case NSF11FunctionKey: return @"f11";
+        case NSF12FunctionKey: return @"f12";
         case 0x1b: return @"escape";
         case '\r': return @"enter";
         case '\t': return @"tab";
@@ -1804,6 +2021,18 @@ void NativeSdkCefClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     if (webview_key_.empty()) return;
     NSString *key = [[NSString alloc] initWithBytes:webview_key_.data() length:webview_key_.size() encoding:NSUTF8StringEncoding];
     [host_ cleanupClosedWebViewWithKey:key ?: @"" generation:webview_generation_];
+}
+
+void NativeSdkCefClient::OnGotFocus(CefRefPtr<CefBrowser> browser) {
+    (void)browser;
+    if (!host_) return;
+    if (!webview_key_.empty()) {
+        NSString *key = [[NSString alloc] initWithBytes:webview_key_.data() length:webview_key_.size() encoding:NSUTF8StringEncoding];
+        if (![host_ webViewGeneration:webview_generation_ matchesKey:key ?: @""]) return;
+    }
+    const std::string label = WebViewLabel();
+    NSString *labelString = [[NSString alloc] initWithBytes:label.data() length:label.size() encoding:NSUTF8StringEncoding];
+    [host_ emitViewFocusedForWindowId:window_id_ label:labelString ?: @""];
 }
 
 void NativeSdkCefClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode, const CefString& errorText, const CefString& failedUrl) {
@@ -1918,8 +2147,48 @@ void native_sdk_appkit_run(native_sdk_appkit_host_t *host, native_sdk_appkit_eve
 
 void native_sdk_appkit_stop(native_sdk_appkit_host_t *host) {
     NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
-    [object emitShutdown];
-    [object stop];
+    /* The HOST side's shutdown request — a failed event emit asks for
+     * the teardown (see RunState.emit's catch in macos/root.zig). Not
+     * the quit verb's landing point: that is
+     * native_sdk_appkit_request_stop below. Queued while the run loop
+     * is live so the emit lands on the next turn at top level. Before
+     * the run loop exists (a failed START handler requests shutdown
+     * synchronously — runWithCallback's didShutdown check) the inline
+     * emit stays, or the request would strand. */
+    if (!NSApp.running) {
+        [object emitShutdown];
+        [object stop];
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [object emitShutdown];
+        [object stop];
+    });
+}
+
+void native_sdk_appkit_request_stop(native_sdk_appkit_host_t *host) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    /* The quit VERB's landing point (fx.quitApp), same contract as the
+     * AppKit host's: the verb lands mid dispatch, and a synchronous
+     * SHUTDOWN emit would nest the shutdown dispatch inside the
+     * requesting command's — the session recorder seals the journal on
+     * the nested commit and loses the command record (replay
+     * diverges). While the run loop is live the main-queue hop defers
+     * the emit to the next turn. Before [NSApp run] a quit from
+     * App.start's update must NOT fall back to an inline emit (the
+     * same nesting bug, just pre-run) — the request parks in
+     * pendingPreRunStop and runWithCallback drains it at top level
+     * once the pre-run dispatch that carried it returns. (The inline
+     * pre-run emit lives only in native_sdk_appkit_stop above, for the
+     * host-side failed-START request.) */
+    if (!NSApp.running) {
+        object.pendingPreRunStop = YES;
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [object emitShutdown];
+        [object stop];
+    });
 }
 
 void native_sdk_appkit_load_webview(native_sdk_appkit_host_t *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
@@ -2134,11 +2403,26 @@ int native_sdk_appkit_close_window(native_sdk_appkit_host_t *host, uint64_t wind
 
 int native_sdk_appkit_minimize_window(native_sdk_appkit_host_t *host, uint64_t window_id) {
     NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
-    NSWindow *window = object.windows[@(window_id)];
-    if (!window) return 0;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [window miniaturize:nil];
-    });
+    if (!object.windows[@(window_id)]) return 0;
+    [object miniaturizeWindowWithId:window_id];
+    return 1;
+}
+
+int native_sdk_appkit_show_window(native_sdk_appkit_host_t *host, uint64_t window_id) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    if (!object.windows[@(window_id)]) return 0;
+    // Synchronous by the time it returns 1: the method owns the
+    // on-main/off-main split (closeWindowWithId:'s shape), so the
+    // runtime's post-success focus bookkeeping never runs against a
+    // still-queued show.
+    [object showWindowWithId:window_id];
+    return 1;
+}
+
+int native_sdk_appkit_set_window_close_policy(native_sdk_appkit_host_t *host, uint64_t window_id, int close_policy) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    if (!object.windows[@(window_id)]) return 0;
+    object.windowClosePolicies[@(window_id)] = @(close_policy);
     return 1;
 }
 
@@ -2409,6 +2693,69 @@ int native_sdk_appkit_audio_set_volume(native_sdk_appkit_host_t *host, double vo
     return 0;
 }
 
+/* Video playback lives in the system-engine AppKit host (AVFoundation).
+ * The Chromium host reports the feature unsupported and the Zig side
+ * refuses before calling, so these exist only to satisfy the shared C
+ * ABI — each answers with its honest failure code. */
+int native_sdk_appkit_video_load(native_sdk_appkit_host_t *host, const char *path, size_t path_len, uint64_t token, native_sdk_appkit_video_sink_push_t push_fn, void *push_context) {
+    (void)host;
+    (void)path;
+    (void)path_len;
+    (void)token;
+    (void)push_fn;
+    (void)push_context;
+    return 2;
+}
+
+int native_sdk_appkit_video_load_url(native_sdk_appkit_host_t *host, const char *url, size_t url_len, uint64_t token, native_sdk_appkit_video_sink_push_t push_fn, void *push_context) {
+    (void)host;
+    (void)url;
+    (void)url_len;
+    (void)token;
+    (void)push_fn;
+    (void)push_context;
+    return 2;
+}
+
+int native_sdk_appkit_video_play(native_sdk_appkit_host_t *host) {
+    (void)host;
+    return 0;
+}
+
+int native_sdk_appkit_video_pause(native_sdk_appkit_host_t *host) {
+    (void)host;
+    return 0;
+}
+
+int native_sdk_appkit_video_stop(native_sdk_appkit_host_t *host) {
+    (void)host;
+    return 0;
+}
+
+int native_sdk_appkit_video_seek(native_sdk_appkit_host_t *host, uint64_t position_ms) {
+    (void)host;
+    (void)position_ms;
+    return 0;
+}
+
+int native_sdk_appkit_video_set_volume(native_sdk_appkit_host_t *host, double volume) {
+    (void)host;
+    (void)volume;
+    return 0;
+}
+
+int native_sdk_appkit_video_set_muted(native_sdk_appkit_host_t *host, int muted) {
+    (void)host;
+    (void)muted;
+    return 0;
+}
+
+int native_sdk_appkit_video_set_loop(native_sdk_appkit_host_t *host, int loop) {
+    (void)host;
+    (void)loop;
+    return 0;
+}
+
 void native_sdk_appkit_request_frame(native_sdk_appkit_host_t *host) {
     // The AppKit host pauses FRAME events when idle, so a cross-thread
     // frame request is how the automation arrival watcher wakes it. The
@@ -2560,8 +2907,22 @@ int native_sdk_appkit_update_widget_accessibility(native_sdk_appkit_host_t *host
  * registration so `Options.fonts` apps start identically under both
  * hosts; refusing here would fail startup for a face this host never
  * resolves. */
-int native_sdk_appkit_register_font(uint64_t font_id, const uint8_t *bytes, size_t bytes_len) {
-    if (font_id == 0 || !bytes || bytes_len == 0) return 0;
+int native_sdk_appkit_register_font(uint64_t font_id, const uint8_t *bytes, size_t bytes_len, uint64_t *out_token) {
+    /* Token 0 is the honest report for a stateless accept: nothing was
+     * installed, so there is no registration a token could own and
+     * nothing a later unregister could remove. */
+    if (out_token) *out_token = 0;
+    if (font_id == 0 || !bytes || bytes_len == 0 || !out_token) return 0;
+    return 1;
+}
+
+/* Teardown twin of the stateless accept above: registration retained no
+ * host state here, so Runtime.deinit's per-id unregister has nothing to
+ * return — accept it (whatever token rides it) for the same
+ * start-identically reason. */
+int native_sdk_appkit_unregister_font(uint64_t font_id, uint64_t token) {
+    (void)token;
+    if (font_id == 0) return 0;
     return 1;
 }
 

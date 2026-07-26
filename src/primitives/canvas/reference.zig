@@ -44,9 +44,37 @@ const render_fingerprints = @import("render_fingerprints.zig");
 const vector = @import("vector.zig");
 const font_ttf = @import("font_ttf.zig");
 
-/// Element budget for one glyph outline: the bundled face's densest
-/// glyphs stay well under this (maxp: 96 points per simple glyph).
-const reference_glyph_path_capacity: usize = 256;
+/// Element budget for one glyph outline, derived from the parser's
+/// glyph budgets so every glyph a parsed face maps fits: a contour
+/// emits at most one element per point plus a move, a closing quad, and
+/// a close (points + 3*contours), taken over BOTH glyph forms the gate
+/// admits — a simple glyph's maxima and a composite's flattened maxima
+/// (`maxp.maxCompositePoints`/`maxCompositeContours`, which is what
+/// this builder actually receives when a composite renders). The
+/// budgets are currently equal, so the max is 1408 either way; the
+/// derivation keeps capacity honest if they ever diverge. Stack shape:
+/// at 28 B per element this is ~39 KiB in `drawGlyphOutline`; the edge
+/// accumulator below it is the per-thread heap-resident
+/// `vector.GlyphRasterizer` (see `reference_glyph_raster_scratch`), so
+/// the builder is the only glyph raster state on the stack.
+const reference_glyph_path_capacity: usize = @max(
+    font_ttf.max_glyph_points + 3 * font_ttf.max_glyph_contours,
+    font_ttf.max_composite_points + 3 * font_ttf.max_composite_contours,
+);
+
+/// Per-thread rasterizer for glyph fills: `vector.GlyphRasterizer`'s
+/// derived budgets guarantee every outline the font registration gate
+/// admits rasterizes (never a block fallback), which sizes it at
+/// ~508 KiB — a per-thread heap slot behind one TLS pointer (the
+/// lazy_tls pattern), not a stack temporary and not static TLS. Only
+/// threads that ink a glyph through the reference renderer allocate it.
+/// The array carries no default and stays uninitialized, exactly like
+/// the stack `Rasterizer` it replaces; `vector.fillGlyphPath` resets it
+/// per glyph.
+const ReferenceGlyphRasterScratch = struct {
+    raster: vector.GlyphRasterizer,
+};
+const reference_glyph_raster_scratch = @import("lazy_tls.zig").LazyTls(ReferenceGlyphRasterScratch);
 
 const referenceBlurKernel = reference_blur.referenceBlurKernel;
 const referenceBlurSampleWithKernel = reference_blur.referenceBlurSampleWithKernel;
@@ -62,6 +90,19 @@ pub const ReferenceImage = struct {
     width: usize,
     height: usize,
     pixels: []const u8,
+    /// Precomputed content fingerprint for the GPU cache planner
+    /// (`renderImageFingerprintForResource` uses it when nonzero instead
+    /// of hashing `pixels` at plan time). Media-surface textures set it
+    /// at adoption so a 60 fps producer never pays a full-buffer hash
+    /// per planned frame; 0 — every registered canvas image — keeps the
+    /// classic hash-the-bytes keying byte-identically.
+    content_fingerprint: u64 = 0,
+    /// PRESENTATION-ONLY resource: composited by live GPU/packet hosts,
+    /// invisible to the deterministic reference renderer (see the
+    /// policy comment in `findReferenceImage`). Media-surface textures
+    /// ride the image pipeline with this set, so producer output can
+    /// never leak into goldens, screenshots, or replay pixel marks.
+    presentation_only: bool = false,
 };
 
 /// One runtime-registered font face the reference renderer resolves text
@@ -225,9 +266,11 @@ pub const ReferenceRenderSurface = struct {
     }
 
     pub fn renderPass(self: ReferenceRenderSurface, pass: CanvasRenderPass, clear_color: Color) Error!void {
-        // One-time sRGB decode table fill (see the table's doc comment);
-        // outside the per-pixel loops so the hot path pays no checks.
+        // One-time sRGB decode/encode table fills (see the tables' doc
+        // comments); outside the per-pixel loops so the hot path pays no
+        // checks.
         ensureSrgbToLinearByteTable();
+        ensureLinearToSrgbTable();
         // Fresh per-pass panel-fill budget (see the memo's doc comment).
         if (self.render_memo) |memo| memo.image_scale_fills_this_pass = 0;
         const scale = referencePassScale(pass.scale);
@@ -295,12 +338,21 @@ pub const ReferenceRenderSurface = struct {
         // so no apron rows join the key.
         const probe = self.memoProbe(pixel_rect, 0, referenceMemoParamsHash(2, command, value));
         if (self.memoReplay(probe, pixel_rect)) return;
+        // Square-cornered fills keep the legacy binary pixel-center
+        // test (bit-identical on integer bounds); rounded fills take
+        // the anti-aliased signed-distance coverage.
+        const binary = referenceRadiusIsZero(radius);
         var y = pixel_rect.y;
         while (y < pixel_rect.y + pixel_rect.height) : (y += 1) {
             var x = pixel_rect.x;
             while (x < pixel_rect.x + pixel_rect.width) : (x += 1) {
                 const point = referencePixelCenter(x, y);
-                if (referencePointInRoundedRect(point, rect, radius)) self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), command.opacity);
+                if (binary) {
+                    if (referencePointInRoundedRect(point, rect, radius)) self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), command.opacity);
+                    continue;
+                }
+                const coverage = referenceRoundedRectCoverage(point, rect, radius);
+                if (coverage > 0) self.blendPixelCoverage(@intCast(x), @intCast(y), referenceSampleFill(value.fill, command.transform, point), coverage, command.opacity, .linear_light);
             }
         }
         self.memoStore(probe, pixel_rect);
@@ -323,13 +375,28 @@ pub const ReferenceRenderSurface = struct {
         // blends into, so no apron rows join the key.
         const probe = self.memoProbe(pixel_rect, 0, referenceMemoParamsHash(5, command, value));
         if (self.memoReplay(probe, pixel_rect)) return;
+        // Square-cornered borders keep the legacy binary ring test
+        // (bit-identical on integer bounds). Rounded borders derive
+        // BOTH ring edges from the same signed-distance field —
+        // coverage is outer-edge coverage minus inner-edge coverage —
+        // so the border weight stays uniform around the whole shape
+        // (the inner edge stays in the field even when the inset
+        // radius bottoms out at a square corner).
+        const binary = referenceRadiusIsZero(radius);
         var y = pixel_rect.y;
         while (y < pixel_rect.y + pixel_rect.height) : (y += 1) {
             var x = pixel_rect.x;
             while (x < pixel_rect.x + pixel_rect.width) : (x += 1) {
                 const point = referencePixelCenter(x, y);
-                if (referencePointInRoundedRect(point, outer, outer_radius) and !referencePointInRoundedRect(point, inner, inner_radius)) {
-                    self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.stroke.fill, command.transform, point), command.opacity);
+                if (binary) {
+                    if (referencePointInRoundedRect(point, outer, outer_radius) and !referencePointInRoundedRect(point, inner, inner_radius)) {
+                        self.blendPixel(@intCast(x), @intCast(y), referenceSampleFill(value.stroke.fill, command.transform, point), command.opacity);
+                    }
+                    continue;
+                }
+                const coverage = std.math.clamp(referenceRoundedRectCoverage(point, outer, outer_radius) - referenceRoundedRectCoverage(point, inner, inner_radius), 0, 1);
+                if (coverage > 0) {
+                    self.blendPixelCoverage(@intCast(x), @intCast(y), referenceSampleFill(value.stroke.fill, command.transform, point), coverage, command.opacity, .linear_light);
                 }
             }
         }
@@ -365,6 +432,7 @@ pub const ReferenceRenderSurface = struct {
             .fill = value.fill,
             .transform = command.transform,
             .opacity = command.opacity,
+            .coverage_blend = .linear_light,
         };
         vector.fillPath(
             value.elements,
@@ -392,6 +460,7 @@ pub const ReferenceRenderSurface = struct {
             .fill = value.stroke.fill,
             .transform = command.transform,
             .opacity = command.opacity,
+            .coverage_blend = .linear_light,
         };
         vector.strokePath(
             value.elements,
@@ -744,9 +813,12 @@ pub const ReferenceRenderSurface = struct {
 
     /// Paint one glyph: the real Geist outline through the vector core
     /// when the codepoint resolves, the historical block rect otherwise
-    /// (unmapped codepoints, glyphs beyond the outline budgets, or draws
-    /// carrying no text bytes). Layout is untouched — the pen position
-    /// and advance still come from the deterministic estimator.
+    /// (unmapped codepoints, glyphs of hostile faces whose `maxp`
+    /// under-declares — the per-glyph parse backstops — or draws
+    /// carrying no text bytes; never a gate-admitted glyph, whose raster
+    /// budgets are derived from the registration gate). Layout is
+    /// untouched — the pen position and advance still come from the
+    /// deterministic estimator.
     fn drawGlyphBox(
         self: ReferenceRenderSurface,
         command: RenderCommand,
@@ -799,15 +871,26 @@ pub const ReferenceRenderSurface = struct {
         if (builder.slice().len == 0) return true; // Space: nothing to ink.
 
         const pixel_rect = referencePixelRect(draw_bounds, self.width, self.height) orelse return true;
+        // Glyph coverage blends in sRGB, not linear light (see
+        // `CoverageBlend`): apparent text weight is set by how edge
+        // pixels darken, and re-blending them in linear light thins
+        // dark-on-light runs and blooms light-on-dark runs at UI sizes.
         var sink = ReferenceCoverageSink{
             .surface = self,
             .fill = .{ .color = value.color },
             .transform = command.transform,
             .opacity = command.opacity,
+            .coverage_blend = .srgb,
         };
         // The outline is already in device space; TrueType interiorness
-        // is the nonzero rule.
-        vector.fillPath(
+        // is the nonzero rule. The glyph raster budgets are derived from
+        // the registration gate's outline budgets, so a gate-admitted
+        // face never trips `VectorPathTooComplex` here — the remaining
+        // fallback triggers are a clip band wider than
+        // `max_raster_width` (surface-shaped, not font-shaped) and
+        // nothing else.
+        vector.fillGlyphPath(
+            &reference_glyph_raster_scratch.get().raster,
             builder.slice(),
             Affine.identity(),
             .nonzero,
@@ -845,18 +928,66 @@ pub const ReferenceRenderSurface = struct {
         self.pixels[index + 3] = out[3];
     }
 
+    /// Blend one pixel whose fractional alpha is ANTI-ALIASED EDGE
+    /// COVERAGE (kept separate from the color's own alpha so the blend
+    /// can tell an AA fringe from a translucent wash — see
+    /// `CoverageBlend`).
+    fn blendPixelCoverage(self: ReferenceRenderSurface, x: usize, y: usize, color: Color, coverage: f32, opacity: f32, blend: CoverageBlend) void {
+        const index = (y * self.width + x) * 4;
+        const dst = [4]u8{
+            self.pixels[index + 0],
+            self.pixels[index + 1],
+            self.pixels[index + 2],
+            self.pixels[index + 3],
+        };
+        const out = blendRgba8Coverage(dst, color, coverage, opacity, blend);
+        self.pixels[index + 0] = out[0];
+        self.pixels[index + 1] = out[1];
+        self.pixels[index + 2] = out[2];
+        self.pixels[index + 3] = out[3];
+    }
+
     fn findImage(self: ReferenceRenderSurface, id: ImageId) ?ReferenceImage {
         return findReferenceImage(self.images, id);
     }
 };
 
+/// Which space a shape's fractional edge coverage blends in.
+///
+/// GEOMETRY — rounded rects, filled/stroked paths, icons, chart marks —
+/// blends its anti-aliased edge pixels in LINEAR LIGHT. Compositing the
+/// sRGB-encoded bytes directly weights half coverage far below half the
+/// light (a 50% black-on-white fringe lands near 21% luminance instead
+/// of 50%), so every edge grows a dark rim on light backgrounds (a light
+/// halo on dark ones) that reads as jagged even though the coverage
+/// values are correct. Decoding to linear light, blending, and
+/// re-encoding removes the rim.
+///
+/// GLYPHS stay in sRGB. Text coverage funnels through the exact same
+/// vector core, but apparent text WEIGHT is a product of how edge pixels
+/// darken: the same coverage blended in linear light renders visibly
+/// thinner dark-on-light runs and bloomier light-on-dark runs at UI
+/// sizes, and the toolkit's type ramp was tuned against sRGB-blended
+/// stems. sRGB glyph compositing also matches the packet-backed macOS
+/// text pipeline, so mixed CPU/host frames keep one text weight.
+///
+/// Only opaque-source fractional-coverage pixels differ between the two
+/// modes: fully covered pixels short-circuit identically in either
+/// space, and translucent sources (washes, scrims, faded layers) keep
+/// sRGB blending so overlay brightness — tuned in sRGB terms — is
+/// untouched and an AA edge never diverges from the interior it borders.
+const CoverageBlend = enum { linear_light, srgb };
+
 /// Per-pixel coverage sink for the vector core: samples the fill at the
-/// pixel center and blends with the coverage folded into alpha.
+/// pixel center and blends with the coverage, in the blend space the
+/// emitter declared (geometry linear-light, glyphs sRGB — see
+/// `CoverageBlend`).
 const ReferenceCoverageSink = struct {
     surface: ReferenceRenderSurface,
     fill: Fill,
     transform: Affine,
     opacity: f32,
+    coverage_blend: CoverageBlend,
 
     pub fn pixel(self: *ReferenceCoverageSink, x: i32, y: i32, coverage: f32) void {
         if (x < 0 or y < 0) return;
@@ -865,7 +996,7 @@ const ReferenceCoverageSink = struct {
         if (px >= self.surface.width or py >= self.surface.height) return;
         const point = referencePixelCenter(px, py);
         const color = referenceSampleFill(self.fill, self.transform, point);
-        self.surface.blendPixel(px, py, referenceScaleColorAlpha(color, coverage), self.opacity);
+        self.surface.blendPixelCoverage(px, py, color, coverage, self.opacity, self.coverage_blend);
     }
 };
 
@@ -1174,6 +1305,15 @@ fn referenceImagePixelLen(width: usize, height: usize) ?usize {
 
 fn findReferenceImage(images: []const ReferenceImage, id: ImageId) ?ReferenceImage {
     for (images) |image| {
+        // THE REFERENCE-RENDERER MEDIA POLICY: presentation-only
+        // resources (media-surface textures pushed by external
+        // producers) do not exist for the deterministic CPU path. The
+        // draw referencing one skips — exactly like an unregistered id —
+        // so the surface's id-derived placeholder beneath it is what
+        // reference renders, screenshots, replay pixel marks, and
+        // GOLDENS show. Goldens can therefore never depend on producer
+        // output; only live GPU/packet hosts composite the real texture.
+        if (image.presentation_only) continue;
         if (image.id == id) return image;
     }
     return null;
@@ -1315,6 +1455,31 @@ fn ensureSrgbToLinearByteTable() void {
     srgb_to_linear_byte_table_ready = true;
 }
 
+/// Precomputed `referenceLinearToSrgb` over evenly spaced linear inputs:
+/// the linear-light coverage blend re-encodes three channels per fringe
+/// pixel, and each direct encode costs a `pow`. 4096 entries keep the
+/// nearest-entry result within one 8-bit step of direct evaluation: the
+/// curve is steepest near black (slope 12.92), where one table cell
+/// still spans under one output byte step, so the looked-up value sits
+/// within half a step of exact and the final byte rounding moves by at
+/// most one level. Same benign-race lazy fill as the decode table above.
+const linear_to_srgb_table_len = 4096;
+var linear_to_srgb_table: [linear_to_srgb_table_len]f32 = undefined;
+var linear_to_srgb_table_ready: bool = false;
+
+fn ensureLinearToSrgbTable() void {
+    if (linear_to_srgb_table_ready) return;
+    for (&linear_to_srgb_table, 0..) |*value, index| {
+        value.* = referenceLinearToSrgb(@as(f32, @floatFromInt(index)) / (linear_to_srgb_table_len - 1));
+    }
+    linear_to_srgb_table_ready = true;
+}
+
+fn referenceLinearToSrgbLut(value: f32) f32 {
+    const index: usize = @intFromFloat(@round(std.math.clamp(value, 0, 1) * (linear_to_srgb_table_len - 1)));
+    return linear_to_srgb_table[index];
+}
+
 fn referencePremultiplySrgba8(pixel: [4]u8) ReferencePremultipliedLinearColor {
     const alpha = @as(f32, @floatFromInt(pixel[3])) / 255.0;
     return .{
@@ -1357,6 +1522,61 @@ fn referencePointInRoundedRect(point: geometry.PointF, rect: geometry.RectF, rad
         return referencePointInCorner(point, geometry.PointF.init(normalized.x + bottom_left, normalized.maxY() - bottom_left), bottom_left);
     }
     return true;
+}
+
+/// True when every corner is square — the gate for the legacy binary
+/// pixel-center rasterization, which keeps radius-0 rects on integer
+/// bounds bit-identical to their historical bytes.
+fn referenceRadiusIsZero(radius: Radius) bool {
+    return radius.top_left <= 0 and radius.top_right <= 0 and
+        radius.bottom_right <= 0 and radius.bottom_left <= 0;
+}
+
+/// Fractional coverage of the pixel centered at `point` against a
+/// rounded rect: `clamp(0.5 - d, 0, 1)` of the EXACT signed distance to
+/// the shape boundary. One closed form serves arcs and straight
+/// segments alike, so coverage is a continuous function around the
+/// whole perimeter — a per-region model (arc ramp here, binary edge
+/// there) disagrees with itself about where the boundary is at the
+/// hand-off points and grows nubs or notches into the silhouette.
+///
+/// The distance is the classic rounded-rect field: with `q = |p - c| -
+/// (half_extent - r)` for the corner radius `r` of the quadrant `p`
+/// lies in, `d = length(max(q, 0)) + min(max(q.x, q.y), 0) - r`. It is
+/// exact for any per-corner radii, including square (r = 0) corners,
+/// and along a straight segment it reduces to the plain axis distance
+/// (the selected radius cancels), so the field is continuous where
+/// quadrants with different radii meet. Cheap fully-inside/outside
+/// short circuits keep the square root off interior and far-apron
+/// pixels; the exact form runs only near the boundary band.
+fn referenceRoundedRectCoverage(point: geometry.PointF, rect: geometry.RectF, radius: Radius) f32 {
+    const normalized = rect.normalized();
+    if (normalized.isEmpty()) return 0;
+    const max_radius = @min(normalized.width, normalized.height) * 0.5;
+
+    const half_width = normalized.width * 0.5;
+    const half_height = normalized.height * 0.5;
+    const dx = point.x - (normalized.x + half_width);
+    const dy = point.y - (normalized.y + half_height);
+    const corner_radius = std.math.clamp(nonNegative(if (dx < 0)
+        (if (dy < 0) radius.top_left else radius.bottom_left)
+    else
+        (if (dy < 0) radius.top_right else radius.bottom_right)), 0, max_radius);
+
+    const qx = @abs(dx) - half_width + corner_radius;
+    const qy = @abs(dy) - half_height + corner_radius;
+    // Fully inside: with both components non-positive the distance is
+    // `max(qx, qy) - r`, so anything at least half a pixel inside the
+    // radius-inset cross is full coverage.
+    if (@max(qx, qy) <= -0.5) return 1;
+    // Fully outside: the distance is at least `qx - r` (and `qy - r`),
+    // so anything at least half a pixel beyond the bounding box is
+    // zero coverage.
+    if (qx - corner_radius >= 0.5 or qy - corner_radius >= 0.5) return 0;
+    const mx = @max(qx, 0);
+    const my = @max(qy, 0);
+    const distance = @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0) - corner_radius;
+    return std.math.clamp(0.5 - distance, 0, 1);
 }
 
 fn referencePointInCorner(point: geometry.PointF, center: geometry.PointF, radius: f32) bool {
@@ -1445,6 +1665,53 @@ fn blendRgba8(dst: [4]u8, src: Color, opacity: f32) [4]u8 {
         colorChannelToByte((std.math.clamp(src.r, 0, 1) * src_a + dst_r * dst_a * (1 - src_a)) / out_a),
         colorChannelToByte((std.math.clamp(src.g, 0, 1) * src_a + dst_g * dst_a * (1 - src_a)) / out_a),
         colorChannelToByte((std.math.clamp(src.b, 0, 1) * src_a + dst_b * dst_a * (1 - src_a)) / out_a),
+        colorChannelToByte(out_a),
+    };
+}
+
+/// Source-over with the source's fractional alpha split into COLOR alpha
+/// and EDGE COVERAGE, so the blend space can key off what the alpha
+/// means (see `CoverageBlend`).
+///
+/// Linear-light blending is reserved for the one case the split targets:
+/// an effectively opaque source's anti-aliased fringe. Everything else —
+/// sRGB-mode callers (glyphs), fully covered pixels, and translucent
+/// sources — folds coverage into alpha and takes the historical sRGB
+/// blend, byte for byte. That routing is also the cost story: interiors
+/// (`coverage >= 1`) and washes never pay a decode/encode round-trip, so
+/// the linear math runs only on the thin edge band, where the two table
+/// lookups per channel replace `pow` evaluations.
+fn blendRgba8Coverage(dst: [4]u8, src: Color, coverage: f32, opacity: f32, blend: CoverageBlend) [4]u8 {
+    const cov = std.math.clamp(coverage, 0, 1);
+    const src_a = std.math.clamp(src.a, 0, 1) * std.math.clamp(opacity, 0, 1);
+    if (blend == .srgb or cov <= 0 or cov >= 1 or src_a < 1) {
+        return blendRgba8(dst, referenceScaleColorAlpha(src, cov), opacity);
+    }
+
+    // Belt over the renderPass-level fills for direct callers (unit
+    // tests, future paths): two predictable branches per fringe pixel.
+    ensureSrgbToLinearByteTable();
+    ensureLinearToSrgbTable();
+
+    // Alpha stays in coverage space — it counts covered area, not light
+    // — so the alpha math is IDENTICAL to the sRGB path; only the color
+    // channels decode to linear light. `out_a >= cov > 0` here, so the
+    // straight-alpha un-premultiply divide is safe. The source decodes
+    // through the same byte quantization its coverage-1 pixels store,
+    // so a fringe converges exactly onto the interior bytes it borders.
+    const dst_a = @as(f32, @floatFromInt(dst[3])) / 255.0;
+    const out_a = cov + dst_a * (1 - cov);
+    const src_r = srgb_to_linear_byte_table[colorChannelToByte(src.r)];
+    const src_g = srgb_to_linear_byte_table[colorChannelToByte(src.g)];
+    const src_b = srgb_to_linear_byte_table[colorChannelToByte(src.b)];
+    const dst_r = srgb_to_linear_byte_table[dst[0]];
+    const dst_g = srgb_to_linear_byte_table[dst[1]];
+    const dst_b = srgb_to_linear_byte_table[dst[2]];
+    const dst_weight = dst_a * (1 - cov);
+    return .{
+        colorChannelToByte(referenceLinearToSrgbLut((src_r * cov + dst_r * dst_weight) / out_a)),
+        colorChannelToByte(referenceLinearToSrgbLut((src_g * cov + dst_g * dst_weight) / out_a)),
+        colorChannelToByte(referenceLinearToSrgbLut((src_b * cov + dst_b * dst_weight) / out_a)),
         colorChannelToByte(out_a),
     };
 }

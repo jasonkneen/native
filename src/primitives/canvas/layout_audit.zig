@@ -69,11 +69,11 @@ pub const layout_audit_epsilon: f32 = 0.5;
 /// call while the line breakers accumulate per-word measures, so an
 /// exact-fit line can land one f32 ulp past its own frame (~1e-3 px) —
 /// runtimes hide that under the pixel-snap wrap budget (`textWrapMaxWidth`
-/// hands back up to 0.5/scale). The audit widens its simulated wrap by an
-/// eighth of a point: far above accumulated float noise, below the
-/// smallest real overflow (a glyph) and below the smallest runtime snap
-/// budget (0.5/scale at any real scale factor), so exact-fit text stays
-/// clean and genuine wraps still report.
+/// hands back the full snap quantum, 1/scale). The audit widens its
+/// simulated wrap by an eighth of a point: far above accumulated float
+/// noise, below the smallest real overflow (a glyph) and below the
+/// smallest runtime snap budget (1/scale at any real scale factor), so
+/// exact-fit text stays clean and genuine wraps still report.
 pub const layout_audit_wrap_slack: f32 = 0.125;
 
 /// Findings reported per audit pass. A view with more than this many
@@ -395,9 +395,17 @@ fn widgetClipsForAudit(widget: Widget) bool {
 }
 
 /// Whether the clip scope scrolls vertically by design, making vertical
-/// overhang the normal operating mode rather than damage.
+/// overhang the normal operating mode rather than damage. A
+/// horizontal-only scroll view does NOT scroll vertically: content
+/// escaping it downward is damage nothing can reveal.
 fn scopeScrollsVertically(widget: Widget) bool {
-    return widget.kind == .scroll_view or widget.layout.virtualized;
+    return (widget.kind == .scroll_view and widget.scroll_axes.scrollsVertically()) or widget.layout.virtualized;
+}
+
+/// The horizontal twin: a scroll viewport granting the horizontal axis
+/// makes horizontal overhang the operating mode, not damage.
+fn scopeScrollsHorizontally(widget: Widget) bool {
+    return widget.kind == .scroll_view and widget.scroll_axes.scrollsHorizontally() and !widget.layout.virtualized;
 }
 
 /// Nearest ancestor whose clip bounds this node: the first clipping
@@ -428,6 +436,7 @@ fn auditNodeContainerEscape(
     const scope_index = clipScopeIndex(layout, node_index);
     const scope = if (scope_index) |index| layout.nodes[index].frame.normalized() else window.normalized();
     const vertical_checked = if (scope_index) |index| !scopeScrollsVertically(layout.nodes[index].widget) else true;
+    const horizontal_checked = if (scope_index) |index| !scopeScrollsHorizontally(layout.nodes[index].widget) else true;
 
     // Attribute the escape to the outermost offender: if any ancestor
     // inside the same scope is already reported, this node's overhang is
@@ -441,8 +450,16 @@ fn auditNodeContainerEscape(
 
     const frame = node.frame.normalized();
     var overrun_x: f32 = 0;
-    overrun_x = @max(overrun_x, overrunPast(frame.maxX(), scope.maxX()));
-    overrun_x = @max(overrun_x, overrunPast(scope.x, frame.x));
+    if (horizontal_checked) {
+        overrun_x = @max(overrun_x, overrunPast(frame.maxX(), scope.maxX()));
+        overrun_x = @max(overrun_x, overrunPast(scope.x, frame.x));
+    } else if (scope_index) |index| {
+        // A horizontal scroll scope forgives trailing overhang (the
+        // scroll reveals it) but not content stranded BEFORE the
+        // origin: offsets clamp at zero, so anything the region's own
+        // offset cannot explain on the leading side is damage.
+        overrun_x = @max(overrun_x, overrunPast(scope.x, frame.x + layout.nodes[index].widget.value_x));
+    }
     var overrun_y: f32 = 0;
     if (vertical_checked) {
         overrun_y = @max(overrun_y, overrunPast(frame.maxY(), scope.maxY()));
@@ -469,7 +486,7 @@ fn auditNodeContainerEscape(
 /// inline link hotspots follow text metrics by convention; both exempt.
 fn widgetKindIsPointerTarget(kind: WidgetKind) bool {
     return switch (kind) {
-        .button, .toggle_button, .icon_button, .select, .combobox, .input, .text_field, .search_field, .textarea, .checkbox, .radio, .switch_control, .toggle, .slider, .menu_item, .segmented_control, .list_item => true,
+        .button, .toggle_button, .icon_button, .select, .combobox, .input, .text_field, .search_field, .textarea, .checkbox, .radio, .switch_control, .toggle, .slider, .menu_item, .segmented_control, .list_item, .terminal => true,
         else => false,
     };
 }

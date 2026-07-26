@@ -70,7 +70,7 @@ pub fn layoutWidgetDepth(
     };
     len.* += 1;
 
-    const content = frame.inset(widget.layout.padding);
+    const content = windowControlsClearedContent(frame.inset(widget.layout.padding), widget, tokens);
     switch (widget.kind) {
         .row, .breadcrumb, .pagination, .radio_group, .toggle_group => try layoutAxisChildren(widget.children, content, .horizontal, index, depth, output, len, widget.layout, tokens),
         // Button groups flow like rows but at their register's effective
@@ -103,7 +103,7 @@ pub fn layoutWidgetDepth(
         .scroll_view => if (widget.layout.virtualized)
             try layoutVirtualVerticalChildren(widget.children, content, index, depth, output, len, widget.value, widget.layout, tokens)
         else
-            try layoutScrollChildren(widget.children, content, index, depth, output, len, widget.value, tokens),
+            try layoutScrollChildren(widget.children, content, index, depth, output, len, scrollLayoutOffset(widget), tokens),
         .list => if (widget.layout.virtualized)
             try layoutVirtualVerticalChildren(widget.children, content, index, depth, output, len, widget.value, widget.layout, tokens)
         else
@@ -144,7 +144,7 @@ pub fn layoutWidgetDepth(
         // Span paragraphs and span-carrying table cells share the link
         // hotspot child convention (no spans or no children is a no-op).
         .text, .data_cell => try layoutTextSpanLinkChildren(widget, content, index, depth, output, len, tokens),
-        .icon, .image, .avatar, .badge, .button, .toggle_button, .icon_button, .select, .input, .text_field, .search_field, .combobox, .textarea, .tooltip, .menu_item, .status_bar, .segmented_control, .checkbox, .radio, .switch_control, .toggle, .slider, .progress, .separator, .skeleton, .spinner, .chart, .split_divider => {},
+        .icon, .image, .avatar, .badge, .button, .toggle_button, .icon_button, .select, .input, .text_field, .search_field, .combobox, .textarea, .tooltip, .menu_item, .status_bar, .segmented_control, .checkbox, .radio, .switch_control, .toggle, .slider, .progress, .separator, .skeleton, .spinner, .chart, .split_divider, .media_surface, .terminal => {},
     }
 
     // Anchored floating children are excluded from every flow above (they
@@ -152,9 +152,149 @@ pub fn layoutWidgetDepth(
     // widget's resolved frame and the window (the layout root's frame).
     // Leaf trigger kinds (select, button, ...) never lay out flow
     // children, but their anchored children float all the same.
-    try layoutAnchoredChildren(widget.children, frame, index, depth, output, len, tokens);
+    // A drag header's anchor base is trimmed clear of the stamped
+    // window-control cluster exactly like its flow content box: the
+    // collision scan counts anchored descendants too, so the remedy must
+    // move them or the one retry is paid for nothing. Non-drag widgets
+    // pass through untouched (menus and popovers anchor everywhere).
+    try layoutAnchoredChildren(widget.children, windowControlsClearedContent(frame, widget, tokens), index, depth, output, len, tokens);
 
     return index;
+}
+
+/// Lay a drag header's content out clear of the OS window-control
+/// cluster. On hidden-titlebar windows the content extends under the
+/// system's control band, and the cluster sits ON the content at one
+/// end — macOS's traffic lights lead, Windows' min/max/close cluster
+/// trails. A `window_drag` widget declares "this row IS the titlebar",
+/// so when the runtime has stamped the cluster's frame into the tokens
+/// (`DesignTokens.window_controls` — only after a build proved content
+/// actually collided; see `windowDragContentUnderWindowControls`), the
+/// row's content box is trimmed on the cluster's side: trailing content
+/// (a right-aligned status line) stops at the cluster's leading edge
+/// instead of rendering under the buttons. Rows whose own padding (or
+/// an app-authored chrome spacer) already clears the cluster never
+/// reach the stamping step, so they lay out byte-identically.
+fn windowControlsClearedContent(content: geometry.RectF, widget: Widget, tokens: DesignTokens) geometry.RectF {
+    if (!widget.window_drag) return content;
+    const controls = (tokens.window_controls orelse return content).normalized();
+    if (controls.width <= 0 or controls.height <= 0) return content;
+    if (geometry.RectF.intersection(content, controls).isEmpty()) return content;
+    var cleared = content;
+    if (controls.x + controls.width / 2 >= content.x + content.width / 2) {
+        // Trailing cluster (Windows caption buttons): the content box
+        // ends where the cluster begins.
+        cleared.width = @max(0, @min(content.maxX(), controls.x) - content.x);
+    } else {
+        // Leading cluster (macOS traffic lights): the content box
+        // starts past the cluster.
+        const start = @min(content.maxX(), @max(content.x, controls.maxX()));
+        cleared.width = @max(0, content.maxX() - start);
+        cleared.x = start;
+    }
+    return cleared;
+}
+
+/// True when a laid-out tree left CONTENT of a drag header under the
+/// window-control cluster (`controls`, canvas-local): the trigger for
+/// the runtime's window-control reservation. Only nodes INSIDE a
+/// visible `window_drag` region count — the drag row is the declared
+/// titlebar, the one place the reservation can honestly re-flow — and
+/// only content-bearing leaves count: text you must read, controls you
+/// must see and press. Containers and full-bleed decoration (the row's
+/// own background, separators, skeletons, progress strips, cover
+/// images) are EXPECTED to run under the cluster, exactly like they do
+/// under macOS traffic lights, so they never trigger. Text leaves are
+/// judged by their PAINTED bounds, not their frame (`tokens` carries
+/// the measurement seam the layout ran with), so a grow/stretch title
+/// whose glyphs sit clear never pays a retry that would visibly shift
+/// it — see `windowControlContentBounds`.
+pub fn windowDragContentUnderWindowControls(nodes: []const WidgetLayoutNode, controls: geometry.RectF, tokens: DesignTokens) bool {
+    const cluster = controls.normalized();
+    if (cluster.width <= 0 or cluster.height <= 0) return false;
+    const layout = LayoutNodesView{ .nodes = nodes };
+    for (nodes, 0..) |node, index| {
+        if (!widget_access.isWindowDragRegion(node.widget)) continue;
+        if (widget_tree.isWidgetHiddenInAncestors(layout, index)) continue;
+        for (nodes, 0..) |candidate, candidate_index| {
+            if (candidate_index == index) continue;
+            if (!widgetIsWindowControlContent(candidate.widget)) continue;
+            const painted = windowControlContentBounds(candidate.widget, candidate.frame.normalized(), tokens);
+            if (geometry.RectF.intersection(painted, cluster).isEmpty()) continue;
+            if (widget_tree.isWidgetHiddenInAncestors(layout, candidate_index)) continue;
+            if (!layoutNodeHasAncestor(nodes, candidate_index, index)) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The rect the cluster test judges for one content candidate. Controls
+/// (buttons, inputs, ...) are judged by their full frame — the hit
+/// surface is the control, glyphs or not. Single-line text leaves are
+/// judged by their ALIGNED PAINTED BOUNDS instead: the measured line
+/// width (capped at the frame — elision and clipping both keep painted
+/// glyphs inside it), placed per the widget's text alignment, at the
+/// frame's full height. A grow/stretch title spanning the header row
+/// (the centered-title pattern) has a FRAME under the cluster while its
+/// inked glyphs sit well clear; judging the frame would trigger the
+/// clearance retry, and the remedy's trimmed content box would then
+/// visibly shift the very title it exists to protect. Span paragraphs
+/// wrap and explicit newlines stack lines with per-line extents; drag
+/// headers are practically single-line, so anything that can break
+/// keeps the conservative frame test.
+fn windowControlContentBounds(widget: Widget, frame: geometry.RectF, tokens: DesignTokens) geometry.RectF {
+    if (widget.kind != .text) return frame;
+    if (widget.spans.len > 0) return frame;
+    if (std.mem.indexOfScalar(u8, widget.text, '\n') != null) return frame;
+    const measured = measuredTextWidth(tokens, widget.text, widgetBodyTextSize(widget, tokens));
+    const width = @min(measured, frame.width);
+    const dx: f32 = switch (widget.text_alignment) {
+        .start => 0,
+        .center => (frame.width - width) * 0.5,
+        .end => frame.width - width,
+    };
+    return geometry.RectF.init(frame.x + dx, frame.y, width, frame.height);
+}
+
+/// Adapter so the shared ancestor-hidden walk (which reads
+/// `layout.nodes`) runs over a bare node slice.
+const LayoutNodesView = struct {
+    nodes: []const WidgetLayoutNode,
+};
+
+fn layoutNodeHasAncestor(nodes: []const WidgetLayoutNode, node_index: usize, ancestor_index: usize) bool {
+    var current: ?usize = nodes[node_index].parent_index;
+    while (current) |index| {
+        if (index >= nodes.len) return false;
+        if (index == ancestor_index) return true;
+        current = nodes[index].parent_index;
+    }
+    return false;
+}
+
+/// Content the window-control cluster must never cover: readable leaves
+/// and interactive controls. Deliberately exhaustive so a new widget
+/// kind forces the honesty call here. Containers are transparent (their
+/// CHILDREN are judged, not their frames), and decorative full-bleed
+/// leaves — separators, skeletons, progress strips, images (header
+/// cover art composites under the OS controls on every platform) — are
+/// allowed under the cluster.
+fn widgetIsWindowControlContent(widget: Widget) bool {
+    return switch (widget.kind) {
+        // Layout and surface containers: judged through their children.
+        .stack, .row, .column, .grid, .data_grid, .table, .scroll_view, .list, .breadcrumb, .button_group, .pagination, .radio_group, .tabs, .toggle_group, .accordion, .bubble, .resizable, .alert, .card, .dialog, .drawer, .sheet, .panel, .popover, .menu_surface, .dropdown_menu, .list_item, .data_row, .split, .tree, .input_group => false,
+        // Full-bleed decoration: expected under the cluster. Media
+        // surfaces join images here — full-bleed video/preview content
+        // composites under the OS controls exactly like header cover art.
+        .separator, .skeleton, .progress, .image, .split_divider, .media_surface => false,
+        // A text leaf with no bytes and no spans is a hit/semantics
+        // overlay, not readable content.
+        .text => widget.text.len > 0 or widget.spans.len > 0,
+        // The terminal's grid is readable content edge to edge — the
+        // cluster must never cover its rows.
+        .data_cell, .icon, .avatar, .badge, .button, .toggle_button, .icon_button, .select, .input, .text_field, .search_field, .combobox, .textarea, .tooltip, .menu_item, .status_bar, .segmented_control, .checkbox, .radio, .switch_control, .toggle, .slider, .spinner, .chart, .terminal => true,
+    };
 }
 
 fn layoutAnchoredChildren(
@@ -178,7 +318,11 @@ fn layoutAnchoredChildren(
 /// width), placed on the preferred side of the anchor rect — flipping to
 /// the other side when it does not fit and the other side has more room —
 /// with height clamped to the chosen side's space and both axes clamped
-/// into the window. Pure geometry, unit-testable on its own.
+/// into the window. A point anchor (`anchor.point`) replaces the anchor
+/// rect with a zero-size rect at that point (clamped into the window), so
+/// the same flip and clamp rules position a surface against an explicit
+/// coordinate — the context-menu-at-the-pointer shape. Pure geometry,
+/// unit-testable on its own.
 pub fn anchoredWidgetFrame(
     child: Widget,
     anchor: widget_model.WidgetAnchor,
@@ -187,7 +331,12 @@ pub fn anchoredWidgetFrame(
     tokens: DesignTokens,
 ) geometry.RectF {
     const window = window_rect.normalized();
-    const anchor_frame = anchor_rect.normalized();
+    const anchor_frame = if (anchor.point) |point| geometry.RectF.init(
+        std.math.clamp(point.x, window.x, window.maxX()),
+        std.math.clamp(point.y, window.y, window.maxY()),
+        0,
+        0,
+    ) else anchor_rect.normalized();
     const intrinsic = intrinsicWidgetSize(child, tokens);
 
     var width = if (child.frame.width > 0) child.frame.width else intrinsic.width;
@@ -384,7 +533,22 @@ fn widgetInsideVerticalScrollScope(output: []const WidgetLayoutNode, parent_inde
     var current: ?usize = parent_index;
     while (current) |index| {
         const widget = output[index].widget;
-        if (widget.kind == .scroll_view or widget.layout.virtualized) return true;
+        if ((widget.kind == .scroll_view and widget.scroll_axes.scrollsVertically()) or widget.layout.virtualized) return true;
+        if (widget.layout.anchor != null) return false;
+        current = output[index].parent_index;
+    }
+    return false;
+}
+
+/// The horizontal twin of `widgetInsideVerticalScrollScope`: inside a
+/// HORIZONTALLY scrolling scope (a `.scroll_view` ancestor granting the
+/// horizontal axis), content wider than the viewport is the operating
+/// mode, so the horizontal overflow diagnostic stays quiet there.
+fn widgetInsideHorizontalScrollScope(output: []const WidgetLayoutNode, parent_index: usize) bool {
+    var current: ?usize = parent_index;
+    while (current) |index| {
+        const widget = output[index].widget;
+        if (widget.kind == .scroll_view and widget.scroll_axes.scrollsHorizontally() and !widget.layout.virtualized) return true;
         if (widget.layout.anchor != null) return false;
         current = output[index].parent_index;
     }
@@ -402,13 +566,15 @@ fn widgetInsideVerticalScrollScope(output: []const WidgetLayoutNode, parent_inde
 ///   virtualized scroll's content wrapper is sized to the viewport and
 ///   its children legitimately extend past it on every rebuild, which
 ///   used to repeat this line hundreds of times for a perfectly correct
-///   layout. Horizontal overflow still warns there — nothing scrolls
-///   sideways to reveal it.
+///   layout. Horizontal overflow warns there UNLESS a horizontally
+///   scrolling scope encloses it — a `horizontal`/`both` scroll view
+///   exists precisely to reveal sideways content.
 /// - The line names the concrete widget (root-first kind path, label
 ///   snippet, id — the same identity the layout audit prints), because
 ///   a bare kind like "column" is unactionable in any real tree.
 fn logAxisChildrenOverflow(output: []const WidgetLayoutNode, parent_index: usize, axis: LayoutAxis, available_extent: f32, used_extent: f32, overflow: f32) void {
     if (axis == .vertical and widgetInsideVerticalScrollScope(output, parent_index)) return;
+    if (axis == .horizontal and widgetInsideHorizontalScrollScope(output, parent_index)) return;
     if (builtin.is_test) test_axis_overflow_diagnostics += 1;
     if (builtin.mode != .Debug) return;
     var path_buffer: [256]u8 = undefined;
@@ -867,6 +1033,17 @@ fn preferredGridRowExtent(children: []const Widget, columns: usize, tokens: Desi
     return max_height;
 }
 
+/// The layout-time scroll displacement of a non-virtualized scroll
+/// view: each offset applies only on an axis the region grants, so a
+/// stale `value_x` on a vertical-only region can never shear its
+/// content sideways — and a stale `value` on a horizontal-only one can
+/// never leave it displaced upward.
+fn scrollLayoutOffset(widget: Widget) geometry.OffsetF {
+    const scroll_x = if (widget.scroll_axes.scrollsHorizontally()) widget.value_x else 0;
+    const scroll_y = if (widget.scroll_axes.scrollsVertically()) widget.value else 0;
+    return geometry.OffsetF.init(scroll_x, scroll_y);
+}
+
 fn layoutScrollChildren(
     children: []const Widget,
     content: geometry.RectF,
@@ -874,10 +1051,10 @@ fn layoutScrollChildren(
     depth: usize,
     output: []WidgetLayoutNode,
     len: *usize,
-    scroll_y: f32,
+    scroll_offset: geometry.OffsetF,
     tokens: DesignTokens,
 ) Error!void {
-    const scrolled_content = content.translate(geometry.OffsetF.init(0, -scroll_y));
+    const scrolled_content = content.translate(geometry.OffsetF.init(-scroll_offset.dx, -scroll_offset.dy));
     for (children) |child| {
         if (child.layout.anchor != null) continue;
         _ = try layoutWidgetDepth(child, stackChildFrame(scrolled_content, child), parent_index, depth + 1, output, len, tokens);
@@ -1368,6 +1545,12 @@ pub fn intrinsicWidgetSize(widget: Widget, tokens: DesignTokens) geometry.SizeF 
 }
 
 fn intrinsicWidgetSizeDepth(widget: Widget, tokens: DesignTokens, depth: usize) geometry.SizeF {
+    // The composed-media contract (`WidgetLayoutStyle.zero_intrinsic`):
+    // the container measures like the media-surface leaf regardless of
+    // what chrome it composes. Declared width/height still apply — they
+    // ride the widget frame and the min/max bounds, which every caller
+    // maxes against this measure.
+    if (widget.layout.zero_intrinsic) return geometry.SizeF.zero();
     return switch (widget.kind) {
         .text => intrinsicTextWidgetSize(widget, tokens, widgetBodyTextSize(widget, tokens)),
         .icon => geometry.SizeF.init(intrinsicIconExtent(widget, tokens), intrinsicIconExtent(widget, tokens)),
@@ -1451,7 +1634,13 @@ fn intrinsicWidgetSizeDepth(widget: Widget, tokens: DesignTokens, depth: usize) 
         .split_divider => geometry.SizeF.init(splitDividerExtent(widget), 0),
         // A split fills the space it is given (panes partition it);
         // like scroll viewports it reports no intrinsic size of its own.
-        .scroll_view, .image, .split => geometry.SizeF.zero(),
+        // Media surfaces measure like images: the texture is external
+        // content with no natural layout size — definite width/height
+        // (or flex grow) size the surface, exactly like an image leaf.
+        // Terminals join them: the grid derives its cols/rows FROM the
+        // space it is given (the runtime resizes the pty to fit), so
+        // reporting an intrinsic size would invert the contract.
+        .scroll_view, .image, .split, .media_surface, .terminal => geometry.SizeF.zero(),
     };
 }
 
@@ -1545,7 +1734,10 @@ fn intrinsicGridChildrenSize(widget: Widget, tokens: DesignTokens, depth: usize)
         cell_height = @max(cell_height, size.height);
     }
     const columns = gridColumnCount(widget.children.len, widget.layout.columns);
-    const rows = (widget.children.len + columns - 1) / columns;
+    // `gridRowCount`, not the additive ceil-div: declared columns are
+    // engine input, and `children.len + columns` overflows in safe
+    // builds when a parent intrinsically measures a maxInt-columns grid.
+    const rows = gridRowCount(widget.children.len, columns);
     const gap = nonNegative(widget.layout.gap);
     return paddedIntrinsicSize(widget, geometry.SizeF.init(
         cell_width * @as(f32, @floatFromInt(columns)) + gap * @as(f32, @floatFromInt(columns - 1)),

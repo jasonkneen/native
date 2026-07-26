@@ -25,9 +25,14 @@ export const navSections: NavSection[] = [
     title: "Core Concepts",
     items: [
       { name: "App Model", href: "/app-model" },
+      { name: "TypeScript Cores", href: "/typescript" },
+      { name: "Where Packages Go", href: "/typescript/packages" },
       { name: "Native UI", href: "/native-ui" },
+      { name: "Dynamic Images", href: "/dynamic-images" },
+      { name: "Terminal", href: "/terminal" },
       { name: "State & Data Flow", href: "/state" },
       { name: "Theming", href: "/theming" },
+      { name: "Fonts", href: "/fonts" },
       { name: "Building Components", href: "/building-components" },
     ],
   },
@@ -73,7 +78,10 @@ export const navSections: NavSection[] = [
   },
   {
     title: "Mobile & Embedding",
-    items: [{ name: "Embedded App", href: "/embed" }],
+    items: [
+      { name: "Embedded App", href: "/embed" },
+      { name: "Media Producers", href: "/media-producers" },
+    ],
   },
   {
     title: "Web Content",
@@ -95,6 +103,7 @@ export const navSections: NavSection[] = [
       { name: "Platform Support", href: "/platform-support" },
       { name: "Debugging", href: "/debugging" },
       { name: "native doctor", href: "/debugging/doctor" },
+      { name: "Zig 0.16 Notes", href: "/zig" },
       { name: "Extensions", href: "/extensions" },
     ],
   },

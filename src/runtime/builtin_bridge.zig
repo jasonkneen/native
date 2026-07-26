@@ -148,6 +148,12 @@ pub fn RuntimeBuiltinBridge(comptime Runtime: type) type {
         }
 
         pub fn dispatchWebViewBridgeCommand(self: *Runtime, request: bridge.Request, source_window_id: platform.WindowId, result_buffer: []u8, response_buffer: []u8) []const u8 {
+            // A native-only build has no webviews to command (and no page
+            // to command them from); every webview verb answers with the
+            // teaching error instead of a misleading not-found.
+            if (!self.options.web_layer) {
+                return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(error.WebViewLayerNotBuilt), builtinBridgeErrorMessage(error.WebViewLayerNotBuilt));
+            }
             const result = if (std.mem.eql(u8, request.command, "native-sdk.webview.create"))
                 Self.createWebViewFromJson(self, request.payload, source_window_id, result_buffer) catch |err| return bridge.writeErrorResponse(response_buffer, request.id, builtinBridgeErrorCode(err), builtinBridgeErrorMessage(err))
             else if (std.mem.eql(u8, request.command, "native-sdk.webview.list"))
@@ -524,11 +530,16 @@ pub fn RuntimeBuiltinBridge(comptime Runtime: type) type {
             var storage = json.StringStorage.init(output);
             const window_id = try Self.resolveWindowSelector(self, payload, &storage);
             const index = WindowViewMethods.findWindowIndexById(self, window_id) orelse return error.WindowNotFound;
-            var info = self.windows[index].info;
-            info.open = false;
-            info.focused = false;
             try self.closeWindow(window_id);
-            return writeWindowJson(info, output);
+            // The response serializes the TABLE state after the close,
+            // never a hand-cleared copy: closeWindow owns which flags a
+            // close clears (open, focused, AND hidden — a closed
+            // policy-hidden window is gone, not "hidden"), and a copy
+            // maintained here field-by-field silently drifts every time
+            // that set grows. The index stays valid: a closed window
+            // keeps its table slot — slots only compact inside window
+            // create, when a dead slot's id or label is re-used.
+            return writeWindowJson(self.windows[index].info, output);
         }
 
         pub fn resolveWindowSelector(self: *Runtime, payload: []const u8, storage: *json.StringStorage) !platform.WindowId {

@@ -70,7 +70,7 @@ const expected_dashboard_interaction_command_count: usize = 70;
 // deliberately when rendering changes, reviewing the rendered pixels
 // (reference captures or the docs previews — same emitters) first; the
 // spot pixels below still guard basic visibility.
-const expected_dashboard_reference_signature: u64 = 2871108290690187392;
+const expected_dashboard_reference_signature: u64 = 7222753033888946849;
 const expected_dashboard_widget_node_count: usize = 48;
 const expected_dashboard_snapshot_widget_count: usize = 48;
 const refresh_command = "dashboard.refresh";
@@ -278,7 +278,7 @@ pub fn update(model: *Model, msg: Msg) void {
         // runtime already applied, so echoing it back through
         // `.value = model.activity_scroll` on the next rebuild never
         // fights the scroll reconcile rule.
-        .activity_scrolled => |scroll_state| model.activity_scroll = scroll_state.offset,
+        .activity_scrolled => |scroll_state| model.activity_scroll = scroll_state.offset_y,
         .submit_forecast => model.setStatus("Forecast amount submitted."),
         .submit_search => model.setStatus("Segment search submitted."),
         .chrome_changed => |chrome| model.chrome_leading = chrome.insets.left,
